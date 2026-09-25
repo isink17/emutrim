@@ -9,6 +9,7 @@ description: Use when changing ADB transport, smart-socket framing, device track
 - Preserve direct TCP to the configured ADB server. Distinguish host services from device services: select `host:transport:<serial>` before guest shell commands.
 - Keep shell-v2 exit status and stderr. Mutation callers must reject nonzero status; do not fall back to legacy `shell:` for mutations.
 - Handle malformed, invalid, or truncated framing as errors. Add focused parser tests for protocol changes; verify partial reads and EOF behavior.
+- Bound accumulated shell-v2 output at 16 MiB; reject oversized frames before allocation. Exercise production framing with `src/adb/test_support.rs` loopback server.
 - Tracking is event-driven. Reconnect after stream loss without steady-state polling; keep shell requests on their own connections.
 - No runtime `adb.exe` subprocess fallback by default. Physical transports may be observed but must never reach guest mutation.
 - Use a local/mock TCP integration harness for service ordering, stream closure, and reconnect changes; never require a physical device for protocol tests.

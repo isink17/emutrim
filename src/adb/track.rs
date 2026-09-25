@@ -57,6 +57,7 @@ pub fn as_map(snapshot: &[DeviceState]) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adb::test_support::FakeAdb;
 
     #[test]
     fn parses_emulator_snapshot() {
@@ -79,5 +80,12 @@ mod tests {
     #[test]
     fn empty_snapshot_means_no_devices() {
         assert!(parse_snapshot(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn tracker_uses_loopback_smart_socket_service() {
+        let server = FakeAdb::start(|_| Vec::new());
+        let mut tracker = Tracker::connect(server.addr()).unwrap();
+        assert!(tracker.next_snapshot().unwrap().is_empty());
     }
 }

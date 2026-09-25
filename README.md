@@ -31,6 +31,10 @@ The native standard profile excludes the Android 16+ boot-critical `com.google.a
 
 `--dry-run` performs package discovery and prints only the planned package disables. It does not write guest state or invoke mutating shell commands.
 
+## v0.3 failure-path checks
+
+`cargo test` exercises the production smart-socket client against a scripted loopback ADB server; no `adb.exe`, emulator, or device is required. Slimming stages state, reads it back, installs it, and verifies the saved record before the first guest mutation. Restore checkpoints completed reversals, keeping only unresolved work for retry. Malformed, truncated, or over-16-MiB shell-v2 output is rejected.
+
 ## AVD configuration and 16 KB images
 
 `tune-avd` locates the SDK from `ANDROID_SDK_ROOT`, `ANDROID_HOME`, or `%LOCALAPPDATA%\Android\Sdk`; it locates AVDs from `ANDROID_AVD_HOME` or `%USERPROFILE%\.android\avd`. It preserves `config.ini.emutrim.bak`, changes only RAM and host-GPU keys, and leaves audio/camera keys untouched because their safe defaults are image/workload-specific.

@@ -2,6 +2,8 @@ use crate::adb::protocol::{connect, send_service};
 use std::io::{self, Read};
 use std::net::SocketAddr;
 
+const MAX_SHELL_OUTPUT: usize = 16 * 1024 * 1024;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DeviceMetadata {
     pub model: String,
@@ -33,12 +35,23 @@ pub fn shell_v2(addr: SocketAddr, serial: &str, command: &str) -> io::Result<She
     send_service(&mut stream, &format!("host:transport:{serial}"))?;
     send_service(&mut stream, &format!("shell,v2,raw:{command}"))?;
     let mut out = ShellOutput::default();
+    let mut received = 0usize;
     loop {
         let mut header = [0u8; 5];
         stream.read_exact(&mut header)?;
         let len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+        if received
+            .checked_add(len)
+            .is_none_or(|size| size > MAX_SHELL_OUTPUT)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ADB shell-v2 output exceeds 16 MiB",
+            ));
+        }
         let mut payload = vec![0; len];
         stream.read_exact(&mut payload)?;
+        received += len;
         match header[0] {
             1 => out.stdout.push_str(&String::from_utf8_lossy(&payload)),
             2 => out.stderr.push_str(&String::from_utf8_lossy(&payload)),
@@ -75,8 +88,55 @@ pub fn boot_completed(addr: SocketAddr, serial: &str) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adb::test_support::{frame, FakeAdb};
+
     #[test]
-    fn shell_output_defaults_to_success() {
-        assert_eq!(ShellOutput::default().status, 0);
+    fn shell_v2_reads_multiple_output_frames_and_exit_status() {
+        let server =
+            FakeAdb::start(|_| [frame(1, b"out"), frame(2, b"warn"), frame(3, &[0])].concat());
+        let out = shell_v2(server.addr(), "emulator-5554", "true").unwrap();
+        assert_eq!(
+            (out.stdout.as_str(), out.stderr.as_str(), out.status),
+            ("out", "warn", 0)
+        );
+    }
+
+    #[test]
+    fn shell_v2_returns_nonzero_status_and_stderr() {
+        let server = FakeAdb::start(|_| [frame(2, b"denied"), frame(3, &[7])].concat());
+        let out = shell_v2(server.addr(), "emulator-5554", "false").unwrap();
+        assert_eq!((out.status, out.stderr.as_str()), (7, "denied"));
+    }
+
+    #[test]
+    fn shell_v2_rejects_malformed_or_truncated_frames() {
+        for bytes in [
+            vec![1, 0, 0],
+            vec![1, 4, 0, 0, 0, b'x'],
+            frame(1, b"stdout before disconnect"),
+            frame(9, b""),
+            frame(3, b"bad"),
+            vec![1, 0, 0, 0, 1],
+        ] {
+            let server = FakeAdb::start(move |_| bytes.clone());
+            assert!(shell_v2(server.addr(), "emulator-5554", "test").is_err());
+        }
+    }
+
+    #[test]
+    fn shell_v2_rejects_oversized_frame_before_allocating() {
+        let server = FakeAdb::start(|_| [1, 1, 0, 0, 1].to_vec());
+        let err = shell_v2(server.addr(), "emulator-5554", "test").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn shell_v2_surfaces_transport_rejection_and_disconnect() {
+        for server in [
+            FakeAdb::rejecting_transport(),
+            FakeAdb::closing_after_transport(),
+        ] {
+            assert!(shell_v2(server.addr(), "emulator-5554", "test").is_err());
+        }
     }
 }

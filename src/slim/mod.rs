@@ -3,7 +3,7 @@ pub mod state;
 
 use crate::adb::shell::{shell_v2, ShellOutput};
 use crate::slim::profile::{installed_packages, targets, SETTINGS, STATE_PATH};
-use crate::slim::state::{decode, encode};
+use crate::slim::state::{decode, encode, State};
 use std::collections::BTreeSet;
 use std::io;
 use std::net::SocketAddr;
@@ -33,6 +33,56 @@ fn run(addr: SocketAddr, serial: &str, command: &str) -> io::Result<String> {
 }
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn persist_state(addr: SocketAddr, serial: &str, state: &State) -> io::Result<()> {
+    let temporary = format!("{STATE_PATH}.tmp.{}", std::process::id());
+    let encoded = encode(state);
+    run(
+        addr,
+        serial,
+        &format!("printf %s {} > {temporary}", quote(&encoded)),
+    )?;
+    if run(addr, serial, &format!("cat {temporary}"))? != encoded {
+        return Err(io::Error::other(
+            "state record read-back did not match; no guest changes made",
+        ));
+    }
+    run(addr, serial, &format!("mv {temporary} {STATE_PATH}"))?;
+    if run(addr, serial, &format!("cat {STATE_PATH}"))? != encoded {
+        return Err(io::Error::other(
+            "state record verification failed; no guest changes made",
+        ));
+    }
+    Ok(())
+}
+
+fn persist_remaining(addr: SocketAddr, serial: &str, state: &State) -> io::Result<()> {
+    if state.disabled.is_empty() && state.settings.is_empty() {
+        run(addr, serial, &format!("rm -f {STATE_PATH}"))?;
+        Ok(())
+    } else {
+        persist_state(addr, serial, state)
+    }
+}
+
+fn read_state(addr: SocketAddr, serial: &str) -> io::Result<Option<State>> {
+    let response = run(
+        addr,
+        serial,
+        &format!(
+            "if [ -e {STATE_PATH} ]; then printf 'present\\n'; cat {STATE_PATH}; else printf 'missing\\n'; fi"
+        ),
+    )?;
+    if response == "missing\n" {
+        return Ok(None);
+    }
+    let encoded = response.strip_prefix("present\n").ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "invalid state lookup response")
+    })?;
+    decode(encoded)
+        .map(Some)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unrecognized EmuTrim state"))
 }
 
 pub fn slim(addr: SocketAddr, serial: &str, options: &Options) -> io::Result<usize> {
@@ -71,12 +121,7 @@ pub fn slim(addr: SocketAddr, serial: &str, options: &Options) -> io::Result<usi
         return Ok(planned.len());
     }
 
-    let prior = decode(&run(
-        addr,
-        serial,
-        &format!("cat {STATE_PATH} 2>/dev/null || true"),
-    )?)
-    .unwrap_or_default();
+    let prior = read_state(addr, serial)?.unwrap_or_default();
     let mut state = prior.clone();
     for package in &planned {
         if !state.disabled.contains(package) {
@@ -99,23 +144,17 @@ pub fn slim(addr: SocketAddr, serial: &str, options: &Options) -> io::Result<usi
             );
         }
     }
-    let encoded = encode(&state);
-    let write = format!(
-        "printf %s {} > {STATE_PATH} && cat {STATE_PATH}",
-        quote(&encoded)
-    );
-    if run(addr, serial, &write)? != encoded {
-        return Err(io::Error::other(
-            "state record read-back did not match; no guest changes made",
-        ));
-    }
+    persist_state(addr, serial, &state)?;
     let mut changed = 0;
     for package in planned {
         let output = run(addr, serial, &format!("pm disable-user --user 0 {package}"))?;
         if output.contains("disabled-user") || output.contains("new state") {
             changed += 1;
         } else {
-            eprintln!("  package not disabled: {package}: {}", output.trim());
+            return Err(io::Error::other(format!(
+                "package {package} returned unexpected disable output: {}",
+                output.trim()
+            )));
         }
     }
     for (group, ns, key, value) in SETTINGS {
@@ -138,54 +177,75 @@ pub fn restore(addr: SocketAddr, serial: &str) -> io::Result<usize> {
             "refusing non-emulator transport",
         ));
     }
-    let mut state = decode(&run(
-        addr,
-        serial,
-        &format!("cat {STATE_PATH} 2>/dev/null || true"),
-    )?)
-    .ok_or_else(|| {
+    if run(addr, serial, "getprop sys.boot_completed")?.trim() != "1" {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "refusing emulator before boot completion",
+        ));
+    }
+    let mut state = read_state(addr, serial)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "no EmuTrim state record on this emulator",
         )
     })?;
-    let mut pending = Vec::new();
+    let had_changes = !state.disabled.is_empty() || !state.settings.is_empty();
     let mut restored = 0;
-    for package in &state.disabled {
-        match run(addr, serial, &format!("pm enable {package}")) {
-            Ok(out) if out.contains("new state") || out.contains("enabled") => restored += 1,
-            Ok(_) => {}
-            Err(_) => pending.push(package.clone()),
+    let mut failure = None;
+    for package in state.disabled.clone() {
+        let result = run(addr, serial, &format!("pm enable {package}")).and_then(|out| {
+            if out.to_ascii_lowercase().contains("enabled") {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "restore package {package} returned unexpected output: {}",
+                    out.trim()
+                )))
+            }
+        });
+        if let Err(err) = result {
+            failure.get_or_insert_with(|| err.to_string());
+            continue;
         }
+        state.disabled.retain(|saved| saved != &package);
+        persist_remaining(addr, serial, &state)?;
+        restored += 1;
     }
-    for ((ns, key), value) in &state.settings {
-        let command = match value {
-            Some(value) => format!("settings put {ns} {key} {value}"),
-            None => format!("settings delete {ns} {key}"),
-        };
-        run(addr, serial, &command)?;
-    }
-    if let Some(Some(value)) = state
-        .settings
-        .get(&("global".into(), "bluetooth_on".into()))
-    {
-        if value != "0" {
-            run(addr, serial, "cmd bluetooth_manager enable")?;
+    for ((ns, key), value) in state.settings.clone() {
+        let result = (|| {
+            let command = match &value {
+                Some(value) => format!("settings put {ns} {key} {value}"),
+                None => format!("settings delete {ns} {key}"),
+            };
+            run(addr, serial, &command)?;
+            if ns == "global" && key == "bluetooth_on" {
+                if let Some(value) = &value {
+                    if value != "0" {
+                        run(addr, serial, "cmd bluetooth_manager enable")?;
+                    }
+                }
+            }
+            Ok::<(), io::Error>(())
+        })();
+        if let Err(err) = result {
+            failure.get_or_insert_with(|| err.to_string());
+            continue;
         }
+        state.settings.remove(&(ns, key));
+        persist_remaining(addr, serial, &state)?;
     }
-    if pending.is_empty() {
+    if let Some(err) = failure {
+        return Err(io::Error::other(format!(
+            "restore incomplete; rerun restore to retry remaining changes: {err}"
+        )));
+    }
+    // State is removed by the final successful per-item checkpoint above. Empty
+    // records are removed here for legacy records that contained no changes.
+    if !had_changes {
         run(addr, serial, &format!("rm -f {STATE_PATH}"))?;
-    } else {
-        state.disabled = pending;
-        let encoded = encode(&state);
-        run(
-            addr,
-            serial,
-            &format!("printf %s {} > {STATE_PATH}", quote(&encoded)),
-        )?;
-        return Err(io::Error::other(
-            "some packages remain disabled; rerun restore",
-        ));
     }
     Ok(restored)
 }
+
+#[cfg(test)]
+mod integration_tests;
