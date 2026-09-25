@@ -117,8 +117,14 @@ fn serve(mut stream: TcpStream, handler: &Arc<Handler>, mode: Mode, track: Track
     let Ok(service) = read_request(&mut stream) else {
         return;
     };
-    if service == "host:track-devices" {
+    if service == "host:track-devices" || service == "host:devices" || service == "host:devices-l" {
         if stream.write_all(b"OKAY").is_err() {
+            return;
+        }
+        if service == "host:devices" || service == "host:devices-l" {
+            if let TrackResponse::Single(snapshot) = track {
+                write_snapshot(&mut stream, snapshot);
+            }
             return;
         }
         match track {

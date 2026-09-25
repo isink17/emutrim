@@ -267,6 +267,48 @@ fn restore_without_state_is_successful_noop() {
 }
 
 #[test]
+fn state_inspection_is_read_only_and_malformed_state_fails_closed() {
+    let (server, guest) = server(Guest::new());
+    assert!(inspect_state(server.addr(), "emulator-5554")
+        .unwrap()
+        .is_none());
+    assert!(!guest
+        .lock()
+        .unwrap()
+        .commands
+        .iter()
+        .any(|cmd| mutating(cmd)));
+
+    guest.lock().unwrap().files.insert(
+        STATE_PATH.into(),
+        crate::slim::state::encode(&State {
+            disabled: vec!["pkg.a".into()],
+            settings: BTreeMap::new(),
+        }),
+    );
+    assert_eq!(
+        inspect_state(server.addr(), "emulator-5554")
+            .unwrap()
+            .unwrap()
+            .disabled,
+        ["pkg.a"]
+    );
+
+    guest
+        .lock()
+        .unwrap()
+        .files
+        .insert(STATE_PATH.into(), "not-an-emutrim-state\n".into());
+    assert!(inspect_state(server.addr(), "emulator-5554").is_err());
+    let guest = guest.lock().unwrap();
+    assert_eq!(
+        guest.files.get(STATE_PATH).unwrap(),
+        "not-an-emutrim-state\n"
+    );
+    assert!(!guest.commands.iter().any(|cmd| mutating(cmd)));
+}
+
+#[test]
 fn restore_state_read_failure_remains_error() {
     let mut guest = Guest::new();
     guest.failures.insert("if [ -e ".into(), 1);
@@ -348,6 +390,10 @@ fn already_applied_state_skips_duplicate_slim_and_detects_reverted_setting() {
     let (server, guest) = server(Guest::new());
     slim(server.addr(), "emulator-5554", &options(false)).unwrap();
     assert!(already_applied(server.addr(), "emulator-5554", &options(false)).unwrap());
+    assert_eq!(
+        crate::slim_after_boot(server.addr(), "emulator-5554").unwrap(),
+        crate::SlimResult::AlreadyApplied
+    );
     let before = guest
         .lock()
         .unwrap()

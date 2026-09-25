@@ -26,6 +26,12 @@ impl Tracker {
     }
 }
 
+pub fn devices(addr: SocketAddr) -> io::Result<Vec<DeviceState>> {
+    let mut stream = connect(addr)?;
+    send_service(&mut stream, "host:devices-l")?;
+    parse_snapshot(&read_length_prefixed(&mut stream)?)
+}
+
 pub fn parse_snapshot(payload: &[u8]) -> io::Result<Vec<DeviceState>> {
     let text = std::str::from_utf8(payload)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "device list is not UTF-8"))?;
@@ -87,5 +93,17 @@ mod tests {
         let server = FakeAdb::start(|_| Vec::new());
         let mut tracker = Tracker::connect(server.addr()).unwrap();
         assert!(tracker.next_snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn devices_reads_single_smart_socket_snapshot() {
+        let server = FakeAdb::start_with_devices("emulator-5556\toffline\n", |_, _| Vec::new());
+        assert_eq!(
+            devices(server.addr()).unwrap(),
+            vec![DeviceState {
+                serial: "emulator-5556".into(),
+                state: "offline".into()
+            }]
+        );
     }
 }

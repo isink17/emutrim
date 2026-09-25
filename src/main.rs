@@ -1,14 +1,16 @@
 mod adb;
 mod avd;
+mod platform;
 mod slim;
 
-use adb::shell::{boot_completed, metadata, DeviceMetadata};
-use adb::track::{as_map, DeviceState, Tracker};
+use adb::shell::{boot_completed, metadata, shell_v2, DeviceMetadata};
+use adb::track::{as_map, devices, DeviceState, Tracker};
 use slim::Options;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -62,6 +64,8 @@ fn run() -> io::Result<()> {
         }
         "tune-avd" => tune(args),
         "start" => start(args),
+        "doctor" => doctor(args),
+        "stats" => stats(args),
         "list-avds" => {
             for name in avd::list()? {
                 println!("{name}");
@@ -210,10 +214,616 @@ fn tune(args: Vec<String>) -> io::Result<()> {
     Ok(())
 }
 fn start(args: Vec<String>) -> io::Result<()> {
-    let (name, ram) = avd_args(args, "start", true)?;
-    avd::start(&name, ram)?;
-    println!("started {name}; run `emutrim watch` to slim it after boot");
+    let (name, requested_ram, no_slim) = start_args(args)?;
+    let info = avd::inspect(&name)?;
+    let ram = requested_ram.unwrap_or(info.ram_mb);
+    avd::validate_ram(&info, ram)?;
+    if !info.image.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "AVD system image directory not found: {}",
+                info.image.display()
+            ),
+        ));
+    }
+    if !no_slim && !cfg!(windows) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "integrated start requires Windows process-to-console identity verification",
+        ));
+    }
+    let port = avd::available_console_port()?;
+    let serial = format!("emulator-{port}");
+    let mut child = avd::start(&name, ram, port)?;
+    let launch_pid = child.id();
+    println!("started {name} as {serial}");
+    if no_slim {
+        return Ok(());
+    }
+
+    println!("waiting for ADB transport...");
+    let mut observation = TransportObservation::default();
+    let ready = wait_for_transport_with(
+        &serial,
+        240,
+        || devices(default_adb_addr()),
+        || match platform::console_owner_pid(port)? {
+            Some(owner) => Ok(Some(platform::belongs_to_launch(owner, launch_pid)?)),
+            None => Ok(None),
+        },
+        || child.try_wait().map(|status| status.is_none()),
+        || thread::sleep(Duration::from_millis(500)),
+        &mut observation,
+    )?;
+    if !ready {
+        return Err(transport_timeout_error(
+            &serial,
+            child.try_wait()?.is_none(),
+            observation.state.as_deref(),
+            observation.error.as_deref(),
+        ));
+    }
+    let qemu = shell_v2(default_adb_addr(), &serial, "getprop ro.kernel.qemu")?;
+    if qemu.status != 0 || !slim::is_emulator(&serial, &qemu.stdout) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("requested launch did not verify as emulator transport {serial}"),
+        ));
+    }
+
+    println!("waiting for Android boot...");
+    let mut action = None;
+    let boot_result = wait_for_boot_checked(
+        &serial,
+        240,
+        || boot_completed(default_adb_addr(), &serial),
+        || child.try_wait().map(|status| status.is_none()),
+        || thread::sleep(Duration::from_millis(500)),
+        || {
+            action = Some(match slim_after_boot(default_adb_addr(), &serial) {
+                Ok(SlimResult::AlreadyApplied) => {
+                    println!("already slimmed; no guest changes needed");
+                    Ok(())
+                }
+                Ok(SlimResult::Slimmed(count)) => {
+                    println!("slimmed {count} package(s)");
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            });
+        },
+    );
+    match boot_result? {
+        BootWait::Ready => {}
+        BootWait::TimedOut => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("Android boot timed out on {serial}; guest was not modified"),
+            ));
+        }
+        BootWait::ProcessExited => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("emulator process exited before Android boot completed on {serial}"),
+            ));
+        }
+    }
+    action.unwrap_or_else(|| Err(io::Error::other("boot completed without start action")))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlimResult {
+    AlreadyApplied,
+    Slimmed(usize),
+}
+
+fn slim_after_boot(addr: SocketAddr, serial: &str) -> io::Result<SlimResult> {
+    match slim::already_applied(addr, serial, &Options::default())? {
+        true => Ok(SlimResult::AlreadyApplied),
+        false => slim::slim(addr, serial, &Options::default()).map(SlimResult::Slimmed),
+    }
+}
+
+fn start_args(args: Vec<String>) -> io::Result<(String, Option<u32>, bool)> {
+    let mut name = None;
+    let mut ram = None;
+    let mut no_slim = false;
+    for arg in args {
+        if arg == "--no-slim" {
+            no_slim = true;
+        } else if let Some(value) = arg.strip_prefix("--ram=") {
+            if ram.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate --ram",
+                ));
+            }
+            ram = Some(
+                value
+                    .parse()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid --ram"))?,
+            );
+        } else if !arg.starts_with('-') {
+            if name.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "pass exactly one AVD name",
+                ));
+            }
+            name = Some(arg);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid start argument: {arg}"),
+            ));
+        }
+    }
+    Ok((
+        name.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pass an AVD name"))?,
+        ram,
+        no_slim,
+    ))
+}
+
+fn default_adb_addr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5037)
+}
+
+fn doctor(args: Vec<String>) -> io::Result<()> {
+    let mut selected_avd = None;
+    let mut selected_serial = None;
+    for arg in args {
+        if let Some(serial) = arg.strip_prefix("--serial=") {
+            if serial.is_empty() || selected_serial.replace(serial.to_owned()).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid --serial",
+                ));
+            }
+        } else if !arg.starts_with('-') {
+            if selected_avd.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "pass at most one AVD name",
+                ));
+            }
+            selected_avd = Some(arg);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid doctor argument: {arg}"),
+            ));
+        }
+    }
+
+    let mut failures = 0usize;
+    let sdk = match avd::sdk_dir() {
+        Ok(path) => {
+            report_check("PASS", &format!("Android SDK: {}", path.display()));
+            Some(path)
+        }
+        Err(error) => {
+            report_check("FAIL", &format!("Android SDK: {error}"));
+            failures += 1;
+            None
+        }
+    };
+    if let Some(sdk) = &sdk {
+        let emulator = sdk.join("emulator").join("emulator.exe");
+        if emulator.is_file() {
+            report_check("PASS", &format!("emulator.exe: {}", emulator.display()));
+            match Command::new(&emulator).arg("-version").output() {
+                Ok(output) if output.status.success() => {
+                    let version_output = if output.stdout.is_empty() {
+                        &output.stderr
+                    } else {
+                        &output.stdout
+                    };
+                    let version = String::from_utf8_lossy(version_output)
+                        .lines()
+                        .next()
+                        .unwrap_or("version unavailable")
+                        .trim()
+                        .to_owned();
+                    report_check("PASS", &format!("emulator version: {version}"));
+                }
+                _ => report_check("WARN", "emulator version query failed"),
+            }
+        } else {
+            report_check("FAIL", "emulator.exe missing");
+            failures += 1;
+        }
+    }
+    let adb_devices = match devices(default_adb_addr()) {
+        Ok(devices) => {
+            report_check(
+                "PASS",
+                &format!(
+                    "ADB smart socket: reachable; {} transport(s)",
+                    devices.len()
+                ),
+            );
+            Some(devices)
+        }
+        Err(error) => {
+            report_check("FAIL", &format!("ADB smart socket: {error}"));
+            failures += 1;
+            None
+        }
+    };
+    match avd::list() {
+        Ok(avds) => report_check("PASS", &format!("installed AVDs: {}", avds.len())),
+        Err(error) => {
+            report_check("FAIL", &format!("installed AVDs: {error}"));
+            failures += 1;
+        }
+    }
+
+    if let Some(name) = selected_avd {
+        match avd::inspect(&name) {
+            Ok(info) => {
+                report_check("PASS", &format!("AVD config: {}", name));
+                if info.image.is_dir() {
+                    report_check("PASS", &format!("system image: {}", info.image.display()));
+                } else {
+                    report_check(
+                        "FAIL",
+                        &format!("system image missing: {}", info.image.display()),
+                    );
+                    failures += 1;
+                }
+                report_check(
+                    "PASS",
+                    &format!(
+                        "image: API {} / ABI {} / tag {} / pages {}",
+                        info.api,
+                        info.abi,
+                        info.tag,
+                        if info.is_16k {
+                            "16 KB (detected)"
+                        } else {
+                            "not tagged 16 KB"
+                        }
+                    ),
+                );
+                match avd::validate_ram(&info, info.ram_mb) {
+                    Ok(()) => report_check("PASS", &format!("RAM: {} MB compatible", info.ram_mb)),
+                    Err(error) => {
+                        report_check(
+                            "FAIL",
+                            &format!("RAM: {} MB incompatible: {error}", info.ram_mb),
+                        );
+                        failures += 1;
+                    }
+                }
+                report_check(
+                    "PASS",
+                    &format!("GPU: {} / {}", info.gpu_mode, info.gpu_enabled),
+                );
+                report_check(
+                    if info.backup_exists { "PASS" } else { "WARN" },
+                    if info.backup_exists {
+                        "EmuTrim config backup exists"
+                    } else {
+                        "no EmuTrim config backup"
+                    },
+                );
+            }
+            Err(error) => {
+                report_check("FAIL", &format!("AVD {name}: {error}"));
+                failures += 1;
+            }
+        }
+    }
+
+    if let Some(serial) = selected_serial {
+        match adb_devices.as_deref() {
+            Some(devices) => inspect_running_target(&serial, devices, &mut failures)?,
+            None => report_check("FAIL", "target checks skipped: ADB server unavailable"),
+        }
+    }
+    doctor_exit(failures)
+}
+
+fn doctor_exit(failures: usize) -> io::Result<()> {
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "doctor found {failures} material failure(s)"
+        )))
+    }
+}
+
+fn report_check(status: &str, message: &str) {
+    println!("{status} {message}");
+}
+
+fn inspect_running_target(
+    serial: &str,
+    devices: &[DeviceState],
+    failures: &mut usize,
+) -> io::Result<()> {
+    let found = devices
+        .iter()
+        .find(|device| device.serial == serial)
+        .cloned();
+    let Some(device) = found else {
+        match avd::console_port(serial).and_then(|port| {
+            platform::console_owner_pid(port)
+                .ok()
+                .flatten()
+                .map(|pid| (port, pid))
+        }) {
+            Some((port, pid)) => match avd::console::avd_name(port) {
+                Ok(name) => report_check(
+                    "FAIL",
+                    &format!(
+                        "transport {serial}: absent; authenticated emulator console for {name} is still listening (PID {pid}); it may be stuck; guest was not modified"
+                    ),
+                ),
+                Err(_) => report_check(
+                    "FAIL",
+                    &format!(
+                        "transport {serial}: absent; emulator console remains live (PID {pid}), but its AVD name could not be verified"
+                    ),
+                ),
+            },
+            None => report_check("FAIL", &format!("transport {serial}: not found")),
+        }
+        *failures += 1;
+        return Ok(());
+    };
+    if device.state != "device" {
+        report_check("WARN", &format!("transport {serial}: {}", device.state));
+        return Ok(());
+    }
+    if !serial.starts_with("emulator-") {
+        report_check(
+            "FAIL",
+            &format!("transport {serial}: physical or unsupported target; no guest inspection"),
+        );
+        *failures += 1;
+        return Ok(());
+    }
+    match shell_v2(default_adb_addr(), serial, "getprop ro.kernel.qemu") {
+        Ok(qemu) if qemu.status == 0 && slim::is_emulator(serial, &qemu.stdout) => {
+            report_check("PASS", &format!("emulator identity: {serial}"));
+        }
+        Ok(_) => {
+            report_check("FAIL", &format!("emulator identity: {serial} not verified"));
+            *failures += 1;
+            return Ok(());
+        }
+        Err(error) => {
+            report_check("FAIL", &format!("emulator identity: {error}"));
+            *failures += 1;
+            return Ok(());
+        }
+    }
+    let boot = match boot_completed(default_adb_addr(), serial) {
+        Ok(true) => {
+            report_check("PASS", &format!("Android boot: complete on {serial}"));
+            true
+        }
+        Ok(false) => {
+            report_check("WARN", &format!("Android boot: incomplete on {serial}"));
+            false
+        }
+        Err(error) => {
+            report_check("WARN", &format!("Android boot: unavailable ({error})"));
+            false
+        }
+    };
+    match slim::inspect_state(default_adb_addr(), serial) {
+        Ok(None) => report_check("PASS", "EmuTrim state: absent"),
+        Ok(Some(state)) => {
+            report_check(
+                "PASS",
+                &format!(
+                    "EmuTrim state: valid ({} package(s), {} setting(s))",
+                    state.disabled.len(),
+                    state.settings.len()
+                ),
+            );
+            if boot {
+                match slim::already_applied(default_adb_addr(), serial, &Options::default()) {
+                    Ok(true) => report_check("PASS", "EmuTrim state: applied"),
+                    Ok(false) => report_check("WARN", "EmuTrim state: present but guest differs"),
+                    Err(error) => {
+                        report_check("FAIL", &format!("EmuTrim applied-state check: {error}"));
+                        *failures += 1;
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            report_check(
+                "FAIL",
+                &format!("EmuTrim state: invalid or unreadable ({error})"),
+            );
+            *failures += 1;
+        }
+    }
     Ok(())
+}
+
+fn stats(args: Vec<String>) -> io::Result<()> {
+    let (serial, seconds) = stats_args(args)?;
+    let port = avd::console_port(&serial).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "stats requires emulator-<even console port>",
+        )
+    })?;
+    let avd_name = avd::console::avd_name(port)?;
+    let pid = platform::console_owner_pid(port)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no process owns emulator console port",
+        )
+    })?;
+    let before = platform::process_stats(pid)?;
+    thread::sleep(Duration::from_secs(seconds));
+    let after = platform::process_stats(pid)?;
+    let delta = cpu_seconds_delta(before.cpu_seconds, after.cpu_seconds);
+    println!("AVD: {avd_name}  serial: {serial}  process: emulator console");
+    println!("PID: {}", after.pid);
+    println!(
+        "Working Set: {:.1} MB",
+        bytes_to_mb(after.working_set_bytes)
+    );
+    println!("Private memory: {:.1} MB", bytes_to_mb(after.private_bytes));
+    println!(
+        "CPU total: {:.2} s  sample delta ({seconds}s): {:.3} s",
+        after.cpu_seconds, delta
+    );
+    println!("Threads: {}", after.thread_count);
+    if let Some(handles) = after.handle_count {
+        println!("Handles: {handles}");
+    }
+    Ok(())
+}
+
+fn bytes_to_mb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn cpu_seconds_delta(start: f64, end: f64) -> f64 {
+    (end - start).max(0.0)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn stats_arguments_and_memory_conversion_are_bounded() {
+        assert_eq!(
+            stats_args(vec!["emulator-5556".into()]).unwrap(),
+            ("emulator-5556".into(), 1)
+        );
+        assert_eq!(
+            stats_args(vec!["emulator-5556".into(), "--seconds=30".into()]).unwrap(),
+            ("emulator-5556".into(), 30)
+        );
+        assert!(stats_args(vec!["emulator-5556".into(), "--seconds=301".into()]).is_err());
+        assert_eq!(bytes_to_mb(1024 * 1024), 1.0);
+        assert_eq!(cpu_seconds_delta(4.0, 6.5), 2.5);
+        assert_eq!(cpu_seconds_delta(6.5, 4.0), 0.0);
+    }
+
+    #[test]
+    fn doctor_warn_only_succeeds_but_material_failure_fails() {
+        assert!(doctor_exit(0).is_ok());
+        assert!(doctor_exit(1).is_err());
+    }
+}
+
+fn stats_args(args: Vec<String>) -> io::Result<(String, u64)> {
+    let mut serial = None;
+    let mut seconds = 1;
+    for arg in args {
+        if let Some(value) = arg.strip_prefix("--seconds=") {
+            seconds = value
+                .parse::<u64>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid --seconds"))?;
+            if !(1..=300).contains(&seconds) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--seconds must be in 1..=300",
+                ));
+            }
+        } else if !arg.starts_with('-') {
+            if serial.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "pass exactly one serial",
+                ));
+            }
+            serial = Some(arg);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid stats argument: {arg}"),
+            ));
+        }
+    }
+    Ok((
+        serial.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pass a serial"))?,
+        seconds,
+    ))
+}
+
+#[derive(Default)]
+struct TransportObservation {
+    state: Option<String>,
+    error: Option<String>,
+}
+
+fn wait_for_transport_with(
+    serial: &str,
+    attempts: usize,
+    mut snapshot: impl FnMut() -> io::Result<Vec<DeviceState>>,
+    mut owns_port: impl FnMut() -> io::Result<Option<bool>>,
+    mut process_running: impl FnMut() -> io::Result<bool>,
+    mut pause: impl FnMut(),
+    observation: &mut TransportObservation,
+) -> io::Result<bool> {
+    for _ in 0..attempts {
+        if !process_running()? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "emulator process exited before ADB transport became ready",
+            ));
+        }
+        match snapshot() {
+            Ok(devices) => {
+                observation.error = None;
+                if let Some(state) = devices
+                    .iter()
+                    .find(|device| device.serial == serial)
+                    .map(|device| device.state.clone())
+                {
+                    observation.state = Some(state);
+                }
+                if observation.state.as_deref() == Some("device") {
+                    match owns_port()? {
+                        Some(true) => return Ok(true),
+                        Some(false) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                format!("ADB serial {serial} is not owned by launched emulator"),
+                            ));
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Err(error) => observation.error = Some(error.to_string()),
+        }
+        pause();
+    }
+    Ok(false)
+}
+
+fn transport_timeout_error(
+    serial: &str,
+    process_alive: bool,
+    state: Option<&str>,
+    last_error: Option<&str>,
+) -> io::Error {
+    let detail = if !process_alive {
+        "emulator process exited before ADB transport became ready".to_owned()
+    } else if state == Some("offline") {
+        "emulator process is still running, but its ADB transport stayed offline or unavailable; guest was not modified; try Android Studio Cold Boot or inspect emulator logs".to_owned()
+    } else if let Some(error) = last_error {
+        format!("ADB server unavailable ({error}); guest was not modified")
+    } else {
+        "emulator process is still running, but its ADB transport is absent and it may be stuck; guest was not modified; inspect emulator logs or try Android Studio Cold Boot".to_owned()
+    };
+    io::Error::new(io::ErrorKind::TimedOut, format!("{serial}: {detail}"))
 }
 #[derive(Default)]
 struct WatchState {
@@ -369,17 +979,41 @@ fn wait_for_boot(config: &Config, serial: &str, handled: &mut HashSet<String>) {
 fn wait_for_boot_with(
     serial: &str,
     attempts: usize,
-    mut check: impl FnMut() -> io::Result<bool>,
-    mut pause: impl FnMut(),
+    check: impl FnMut() -> io::Result<bool>,
+    pause: impl FnMut(),
     on_ready: impl FnOnce(),
 ) -> bool {
+    matches!(
+        wait_for_boot_checked(serial, attempts, check, || Ok(true), pause, on_ready),
+        Ok(BootWait::Ready)
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootWait {
+    Ready,
+    TimedOut,
+    ProcessExited,
+}
+
+fn wait_for_boot_checked(
+    serial: &str,
+    attempts: usize,
+    mut check: impl FnMut() -> io::Result<bool>,
+    mut process_running: impl FnMut() -> io::Result<bool>,
+    mut pause: impl FnMut(),
+    on_ready: impl FnOnce(),
+) -> io::Result<BootWait> {
     let mut first_error = None;
     for _ in 0..attempts {
+        if !process_running()? {
+            return Ok(BootWait::ProcessExited);
+        }
         pause();
         match check() {
             Ok(true) => {
                 on_ready();
-                return true;
+                return Ok(BootWait::Ready);
             }
             Ok(false) => {}
             Err(err) => {
@@ -396,13 +1030,13 @@ fn wait_for_boot_with(
     } else {
         eprintln!("  timed out waiting for {serial} to finish booting");
     }
-    false
+    Ok(BootWait::TimedOut)
 }
 fn watch_target_matches(target: Option<&str>, serial: &str) -> bool {
     target.is_none_or(|target| target == serial)
 }
 fn print_help() {
-    println!("emutrim 0.2\n\nUsage:\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim watch [--serial=SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim tune-avd [AVD] [--ram=1536]\n  emutrim start AVD [--ram=1536]\n  emutrim list-avds\n\nOnly verified emulator transports are mutated; no adb.exe subprocess is used.");
+    println!("emutrim\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL]\n  emutrim start <AVD> [--ram=N] [--no-slim]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--ram=N]\n  emutrim list-avds\n\nstart launches, waits for Android boot, then slims. --no-slim launches only.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.");
 }
 
 #[cfg(test)]
@@ -612,6 +1246,22 @@ mod target_tests {
     }
 
     #[test]
+    fn integrated_boot_wait_reports_early_process_exit() {
+        let mut action_called = false;
+        let result = wait_for_boot_checked(
+            "emulator-5556",
+            3,
+            || Ok(true),
+            || Ok(false),
+            || panic!("must not wait after process exit"),
+            || action_called = true,
+        )
+        .unwrap();
+        assert_eq!(result, BootWait::ProcessExited);
+        assert!(!action_called);
+    }
+
+    #[test]
     fn fake_tracker_reconnect_retries_only_scoped_target_after_slow_boot() {
         const EVENTS: &[&str] = &[
             "emulator-5554\tdevice\nemulator-5556\toffline\n0123ABC\tdevice\n",
@@ -681,5 +1331,119 @@ mod tests {
     fn physical_transport_is_refused() {
         assert!(!slim::is_emulator("ABC123", "0"));
         assert!(!slim::is_emulator("emulator-5554", "0"));
+    }
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    fn device(serial: &str, state: &str) -> DeviceState {
+        DeviceState {
+            serial: serial.into(),
+            state: state.into(),
+        }
+    }
+
+    #[test]
+    fn start_defaults_ram_to_avd_config_and_accepts_no_slim() {
+        assert_eq!(
+            start_args(vec!["Test_AVD".into(), "--no-slim".into()]).unwrap(),
+            ("Test_AVD".into(), None, true)
+        );
+        assert_eq!(
+            start_args(vec!["Test_AVD".into(), "--ram=4096".into()]).unwrap(),
+            ("Test_AVD".into(), Some(4096), false)
+        );
+        assert!(start_args(vec!["Test_AVD".into(), "Other".into()]).is_err());
+    }
+
+    #[test]
+    fn transport_wait_stays_bound_to_launched_serial_with_other_emulators_online() {
+        let snapshots = Arc::new(Mutex::new(VecDeque::from([
+            vec![
+                device("emulator-5554", "device"),
+                device("emulator-5556", "offline"),
+                device("emulator-5558", "offline"),
+            ],
+            vec![
+                device("emulator-5554", "device"),
+                device("emulator-5556", "device"),
+                device("emulator-5558", "device"),
+            ],
+            vec![
+                device("emulator-5554", "device"),
+                device("emulator-5556", "device"),
+                device("emulator-5558", "device"),
+            ],
+        ])));
+        let source = snapshots.clone();
+        let owners = Arc::new(Mutex::new(VecDeque::from([None, Some(true)])));
+        let owner_source = owners.clone();
+        let mut observation = TransportObservation::default();
+        assert!(wait_for_transport_with(
+            "emulator-5558",
+            3,
+            move || Ok(source.lock().unwrap().pop_front().unwrap_or_default()),
+            move || Ok(owner_source.lock().unwrap().pop_front().unwrap_or(None)),
+            || Ok(true),
+            || {},
+            &mut observation,
+        )
+        .unwrap());
+        assert_eq!(observation.state.as_deref(), Some("device"));
+        assert_eq!(owners.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn transport_timeout_and_owner_collision_fail_closed() {
+        let mut observation = TransportObservation::default();
+        assert!(!wait_for_transport_with(
+            "emulator-5558",
+            2,
+            || Ok(Vec::new()),
+            || Ok(None),
+            || Ok(true),
+            || {},
+            &mut observation,
+        )
+        .unwrap());
+        assert!(wait_for_transport_with(
+            "emulator-5558",
+            1,
+            || Ok(vec![device("emulator-5558", "device")]),
+            || Ok(Some(false)),
+            || Ok(true),
+            || {},
+            &mut observation,
+        )
+        .is_err());
+        assert!(wait_for_transport_with(
+            "emulator-5558",
+            1,
+            || Ok(Vec::new()),
+            || Ok(None),
+            || Ok(false),
+            || {},
+            &mut observation,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn transport_timeout_diagnostic_distinguishes_offline_and_dead_process() {
+        assert!(
+            transport_timeout_error("emulator-5558", true, Some("offline"), None)
+                .to_string()
+                .contains("Cold Boot")
+        );
+        assert!(transport_timeout_error("emulator-5558", false, None, None)
+            .to_string()
+            .contains("process exited"));
+        assert!(transport_timeout_error("emulator-5558", true, None, None)
+            .to_string()
+            .contains("transport is absent"));
     }
 }

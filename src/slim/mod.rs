@@ -85,6 +85,10 @@ fn read_state(addr: SocketAddr, serial: &str) -> io::Result<Option<State>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unrecognized EmuTrim state"))
 }
 
+pub fn inspect_state(addr: SocketAddr, serial: &str) -> io::Result<Option<State>> {
+    read_state(addr, serial)
+}
+
 pub fn already_applied(addr: SocketAddr, serial: &str, options: &Options) -> io::Result<bool> {
     if !is_emulator(serial, &run(addr, serial, "getprop ro.kernel.qemu")?) {
         return Err(io::Error::new(
