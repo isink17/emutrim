@@ -1,87 +1,57 @@
 # EmuTrim
 
-Windows-first, zero-dependency Rust tooling for a running Android Emulator. It is an independent project inspired by ideas in [avdslim](https://github.com/kdbhalala/avdslim), not an official build or fork.
+Windows-first Rust tooling to reduce background work in Android Emulator images. Independent from [avdslim](https://github.com/kdbhalala/avdslim).
 
-## What v0.2 supports
-
-- direct ADB smart-socket connections to `127.0.0.1:5037`; runtime ADB operations never spawn `adb.exe`
-- event-driven `host:track-devices` watching, cached metadata, reconnect handling, and no steady-state polling
-- optional target-scoped watching with `watch --serial=emulator-5556`
-- native `slim`, `restore`/`off`, and real dry-runs
-- Windows AVD discovery, conservative `tune-avd`, and direct `emulator.exe` launch via `start`
+## Quick start
 
 ```powershell
-cargo build --release
-.\target\release\emutrim.exe tune-avd Pixel_API_35 --ram=1536
-.\target\release\emutrim.exe start Pixel_API_35 --ram=1536
-.\target\release\emutrim.exe watch
-.\target\release\emutrim.exe watch --serial=emulator-5554 --dry-run
-
-# Inspect only: no setting, package, state file, or memory command is changed.
-.\target\release\emutrim.exe slim --dry-run
-.\target\release\emutrim.exe slim emulator-5554 --keep=com.google.android.apps.maps --skip=location
-.\target\release\emutrim.exe restore emulator-5554
+emutrim doctor
+emutrim start My_AVD
 ```
 
-Windows intentionally has no Android Studio shim: Android Studio launches `emulator.exe` directly, so EmuTrim neither replaces nor renames it. `tune-avd`, `start`, and `watch` are the supported workflow.
+`start` validates the installed AVD and its RAM, launches `emulator.exe`, binds to the console/ADB port assigned for that launch, waits for that exact transport and Android boot, then slims it. If the AVD already has a verified applied profile, it makes no duplicate guest changes. Use `--no-slim` for launch-only behavior or `--ram=N` to override configured RAM.
 
-## Safety model
+```powershell
+emutrim doctor My_AVD [--serial=emulator-5556]
+emutrim stats emulator-5556 [--seconds=10]
+emutrim slim emulator-5556 --dry-run
+emutrim restore emulator-5556
+emutrim watch --serial=emulator-5556
+emutrim list-avds
+```
 
-`slim` and the watcher require both an `emulator-*` transport and `ro.kernel.qemu=1`; physical devices are observed by the watcher but never mutated. They also require `sys.boot_completed=1`.
+`doctor` is read-only. It checks SDK/emulator availability, ADB reachability, installed AVDs, selected image/config/RAM, and an optional running target and saved state. It exits nonzero on material failures; warnings alone succeed. `stats` reports the Windows emulator process working set, private memory, CPU time/delta, threads, and handles when available. Sampling is read-only.
 
-The native standard profile excludes the Android 16+ boot-critical `com.google.android.bluetooth`. Before any package or setting change, EmuTrim writes and read-backs `/data/local/tmp/emutrim_state.v1` with the intended disabled packages and original setting values. A new plan refuses targets already disabled outside EmuTrim state, because the state format does not preserve their prior status. If state staging or preflight fails, EmuTrim makes no guest changes. `restore` changes only packages in that record and restores recorded settings; partial package failures retain the record for retry. Existing state is not an interoperability promise with other tools.
+If startup times out, EmuTrim reports the transport/boot phase and leaves the guest unchanged. It does not restart the emulator, wipe data, or delete snapshots. An offline or missing transport with a live emulator process is below the guest mutation path; inspect emulator logs or try Android Studio Cold Boot.
 
-`--dry-run` performs package discovery and prints only the planned package disables. It does not write guest state or invoke mutating shell commands.
+## Safety and implementation
 
-## v0.3 failure-path checks
+- Runtime ADB uses direct smart-socket TCP to `127.0.0.1:5037`, including shell-v2 where command status matters. EmuTrim does not spawn `adb.exe` or use `avdslim` at runtime.
+- Slim and restore require an `emulator-*` serial, positive `ro.kernel.qemu=1` identity, and `sys.boot_completed=1`. Physical and unresolved targets are never mutated.
+- Before mutation, EmuTrim persists and reads back the intended reversible state. Restore uses recorded originals only, checkpoints completed reversals, and is safe to retry. Missing state is a no-op; malformed/unreadable state fails closed.
+- The native standard profile protects boot-critical packages. A new plan refuses planned packages already disabled outside EmuTrim's state.
+- AVD RAM validation enforces 4096 MB minimum for detected 16 KB images and refuses values outside 1536–8192 MB. `tune-avd` backs up `config.ini` before changing RAM/GPU keys.
+- `start` is Windows-only when slimming, because it verifies that the selected console port belongs to the process tree it launched before guest mutation. Port selection is bounded to Android Emulator's supported console range. Other online emulators do not redirect it.
+- Watch is event-driven (`host:track-devices`) with bounded boot checks; no steady-state polling or async runtime.
 
-`cargo test` exercises the production smart-socket client against a scripted loopback ADB server; no `adb.exe`, emulator, or device is required. Slimming stages state, reads it back, installs it, and verifies the saved record before the first guest mutation. Restore checkpoints completed reversals, keeping only unresolved work for retry. Malformed, truncated, or over-16-MiB shell-v2 output is rejected.
+## Live-tested images
 
-## v0.5 live acceptance
-
-Slim and restore were exercised for two cycles on a disposable Android 17 / API 37.2 Google APIs x86_64 16 KB AVD while another emulator remained running. Explicit serial selection stayed on the requested emulator; each cycle disabled and restored 49 packages, restored original settings (including missing values), and removed its state record. A target-scoped dry-run watcher observed disconnect/reconnect without acting on the other emulator. This does not establish compatibility with other Android images. The scoped reconnect test used `--dry-run`.
-
-## v0.6 reconnect and restore
-
-Native `watch --serial` was verified across a cold restart of the same disposable AVD while another emulator remained connected. Watcher observed offline/disconnect, waited for framework boot, then verified persisted package/settings state and skipped duplicate mutations. The applied-state check detects reverted package/settings and falls through to slim; fake-server coverage verifies setting reversion. `restore` with no state is a successful no-op; unreadable or invalid existing state remains an error. Fake-server tests cover transient boot-check failures, bounded boot wait, duplicate snapshots, and later reconnect.
-
-## v0.7 recovery and image checks
-
-Deterministic fake-server tests cover interruption around persisted slim state, guest package/settings changes, per-item restore checkpoints, and retrying state cleanup. Persisted state contains the full intended package list and original settings before mutation; restore records each completed reversal and retries unresolved or ambiguous work. Android image acceptance:
+These are specific disposable AVDs, not broad Android-version support claims.
 
 | Image | Page size | RAM | Slim | Restore | Reconnect |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Android 17 / API 37.2 Google APIs x86_64 | 16 KB | 4096 MB | 49 packages | exact settings and package restore; repeat no-op | live tested |
-| Android 12 / API 31 Android TV x86 | 4 KB | 1536 MB | 5 packages | exact settings and package restore; repeat no-op | not tested |
+| Android 17 / API 37.2 Google APIs x86_64 | 16 KB | 4096 MB | 49 packages | exact package/settings restore; repeat no-op | live tested |
+| Android 12 / API 31 Android TV x86 | 4 KB | 1536 MB | 5 packages | exact package/settings restore; repeat no-op | not tested |
 
-The API 31 image has Android TV packages and no installed `com.google.android.bluetooth`; this is a narrow cross-image check, not general Android compatibility evidence. The API 37 long-offline startup observation remains undiagnosed; EmuTrim does not attempt emulator recovery.
+The Android 12 image has TV-specific packages and lacks `com.google.android.bluetooth`; package counts differ by image.
 
-## AVD configuration and 16 KB images
-
-`tune-avd` locates the SDK from `ANDROID_SDK_ROOT`, `ANDROID_HOME`, or `%LOCALAPPDATA%\Android\Sdk`; it locates AVDs from `ANDROID_AVD_HOME` or `%USERPROFILE%\.android\avd`. It preserves `config.ini.emutrim.bak`, changes only RAM and host-GPU keys, and leaves audio/camera keys untouched because their safe defaults are image/workload-specific.
-
-16 KB (`ps16k`) images enforce a 4096 MB minimum. EmuTrim refuses an incompatible `--ram=1536` for `tune-avd` or `start`; it does not pretend the Android Emulator accepted it. `start` uses `-gpu host` and, for compatible non-16-KB images, `-lowram -memory <MB>`.
-
-## Watcher footprint
-
-Windows release watcher, 60 s idle:
-
-```text
-CPU delta:    0.0000 s
-Working set:  8.08 MB
-Private RAM:  3.28 MB
-Threads:      2
-Handles:      81
-```
-
-Windows WMI/CIM permissions blocked independent process-start tracing, so this is not evidence of a measured zero `adb.exe` process count. The implementation uses only direct TCP smart-socket requests for runtime ADB work; `start` intentionally creates only `emulator.exe`.
-
-## Manual emulator check
+## Tests and local build
 
 ```powershell
-.\target\release\emutrim.exe slim emulator-5554 --dry-run
-.\target\release\emutrim.exe slim emulator-5554
-.\target\release\emutrim.exe restore emulator-5554
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --release
 ```
 
-Use a disposable emulator first. Confirm the first command prints packages without guest changes, the second creates the EmuTrim state file and disables only listed installed targets, and restore re-enables only recorded packages and restores the exact saved settings.
+Tests use a scripted local ADB smart-socket server and temporary configs; they do not require a real emulator or modify user AVDs. Real mutation checks use only disposable AVDs.
