@@ -41,6 +41,10 @@ The native standard profile excludes the Android 16+ boot-critical `com.google.a
 
 Slim and restore were exercised for two cycles on a disposable Android 17 / API 37.2 Google APIs x86_64 16 KB AVD while another emulator remained running. Explicit serial selection stayed on the requested emulator; each cycle disabled and restored 49 packages, restored original settings (including missing values), and removed its state record. A target-scoped dry-run watcher observed disconnect/reconnect without acting on the other emulator. This does not establish compatibility with other Android images. The scoped reconnect test used `--dry-run`.
 
+## v0.6 reconnect and restore
+
+Native `watch --serial` was verified across a cold restart of the same disposable AVD while another emulator remained connected. Watcher observed offline/disconnect, waited for framework boot, then verified persisted package/settings state and skipped duplicate mutations. The applied-state check detects reverted package/settings and falls through to slim; fake-server coverage verifies setting reversion. `restore` with no state is a successful no-op; unreadable or invalid existing state remains an error. Fake-server tests cover transient boot-check failures, bounded boot wait, duplicate snapshots, and later reconnect.
+
 ## AVD configuration and 16 KB images
 
 `tune-avd` locates the SDK from `ANDROID_SDK_ROOT`, `ANDROID_HOME`, or `%LOCALAPPDATA%\Android\Sdk`; it locates AVDs from `ANDROID_AVD_HOME` or `%USERPROFILE%\.android\avd`. It preserves `config.ini.emutrim.bak`, changes only RAM and host-GPU keys, and leaves audio/camera keys untouched because their safe defaults are image/workload-specific.

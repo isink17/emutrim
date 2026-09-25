@@ -11,6 +11,7 @@ description: Use for guest mutation, package profiles, state format, restore, or
 - Before mutation, capture original settings and intended disabled packages, stage state, read it back, install it, and verify canonical state. Unknown/unreadable existing state fails closed.
 - Slim stops on the first failed or ambiguous package disable; pre-recorded plan keeps already-applied and not-yet-attempted packages recoverable.
 - Restore only values/packages recorded by EmuTrim. Never guess defaults. Checkpoint each successful reversal; retain failed items for retry. Repeated restore must be safe.
+- A missing state record is a valid already-restored condition: `restore` succeeds as a no-op. Read/protocol failures and malformed or unknown existing state remain errors.
 - Keep boot-critical packages protected. Treat unrecognized/new Android versions conservatively; do not infer safety from upstream profile alone.
 - Check shell-v2 exit status for every mutation. Unknown or partial failures fail closed and retain enough state for recovery.
 - Unit tests use fakes/parsers. Intentional guest mutation integration tests use disposable emulators; never physical devices or user AVD config.

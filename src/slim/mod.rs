@@ -85,6 +85,49 @@ fn read_state(addr: SocketAddr, serial: &str) -> io::Result<Option<State>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unrecognized EmuTrim state"))
 }
 
+pub fn already_applied(addr: SocketAddr, serial: &str, options: &Options) -> io::Result<bool> {
+    if !is_emulator(serial, &run(addr, serial, "getprop ro.kernel.qemu")?) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing non-emulator transport",
+        ));
+    }
+    if run(addr, serial, "getprop sys.boot_completed")?.trim() != "1" {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "refusing emulator before boot completion",
+        ));
+    }
+    let Some(state) = read_state(addr, serial)? else {
+        return Ok(false);
+    };
+    let installed = installed_packages(&run(addr, serial, "pm list packages")?);
+    let planned = targets(&installed, &options.keep, &options.skip);
+    if planned
+        .iter()
+        .any(|package| !state.disabled.contains(package))
+    {
+        return Ok(false);
+    }
+    let disabled = installed_packages(&run(addr, serial, "pm list packages -d")?);
+    if planned.iter().any(|package| !disabled.contains(package)) {
+        return Ok(false);
+    }
+    for (group, namespace, key, value) in SETTINGS {
+        if options.skip.contains(*group) {
+            continue;
+        }
+        if !state
+            .settings
+            .contains_key(&(namespace.to_string(), key.to_string()))
+            || run(addr, serial, &format!("settings get {namespace} {key}"))?.trim() != *value
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub fn slim(addr: SocketAddr, serial: &str, options: &Options) -> io::Result<usize> {
     if !is_emulator(serial, &run(addr, serial, "getprop ro.kernel.qemu")?) {
         return Err(io::Error::new(
@@ -169,7 +212,7 @@ pub fn slim(addr: SocketAddr, serial: &str, options: &Options) -> io::Result<usi
     Ok(changed)
 }
 
-pub fn restore(addr: SocketAddr, serial: &str) -> io::Result<usize> {
+pub fn restore(addr: SocketAddr, serial: &str) -> io::Result<Option<usize>> {
     if !is_emulator(serial, &run(addr, serial, "getprop ro.kernel.qemu")?) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -182,12 +225,9 @@ pub fn restore(addr: SocketAddr, serial: &str) -> io::Result<usize> {
             "refusing emulator before boot completion",
         ));
     }
-    let mut state = read_state(addr, serial)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "no EmuTrim state record on this emulator",
-        )
-    })?;
+    let Some(mut state) = read_state(addr, serial)? else {
+        return Ok(None);
+    };
     let had_changes = !state.disabled.is_empty() || !state.settings.is_empty();
     let mut restored = 0;
     let mut failure = None;
@@ -243,7 +283,7 @@ pub fn restore(addr: SocketAddr, serial: &str) -> io::Result<usize> {
     if !had_changes {
         run(addr, serial, &format!("rm -f {STATE_PATH}"))?;
     }
-    Ok(restored)
+    Ok(Some(restored))
 }
 
 #[cfg(test)]

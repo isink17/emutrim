@@ -47,6 +47,11 @@ impl Guest {
             self.boot.clone()
         } else if command == "pm list packages" {
             "package:com.google.android.apps.maps\npackage:com.google.android.youtube\n".into()
+        } else if command == "pm list packages -d" {
+            self.disabled
+                .iter()
+                .map(|package| format!("package:{package}\n"))
+                .collect()
         } else if command.starts_with("if [ -e ") {
             let path = command
                 .split_once("if [ -e ")
@@ -206,6 +211,38 @@ fn unknown_existing_state_is_not_overwritten() {
 }
 
 #[test]
+fn restore_without_state_is_successful_noop() {
+    let (server, guest) = server(Guest::new());
+    assert_eq!(restore(server.addr(), "emulator-5554").unwrap(), None);
+    let guest = guest.lock().unwrap();
+    assert!(!guest.commands.iter().any(|cmd| mutating(cmd)));
+    assert!(!guest.files.contains_key(STATE_PATH));
+}
+
+#[test]
+fn restore_state_read_failure_remains_error() {
+    let mut guest = Guest::new();
+    guest.failures.insert("if [ -e ".into(), 1);
+    let (server, guest) = server(guest);
+    assert!(restore(server.addr(), "emulator-5554").is_err());
+    let guest = guest.lock().unwrap();
+    assert!(!guest.commands.iter().any(|cmd| mutating(cmd)));
+}
+
+#[test]
+fn restore_unknown_state_remains_error_and_preserves_record() {
+    let mut guest = Guest::new();
+    guest
+        .files
+        .insert(STATE_PATH.into(), "future-version\n".into());
+    let (server, guest) = server(guest);
+    assert!(restore(server.addr(), "emulator-5554").is_err());
+    let guest = guest.lock().unwrap();
+    assert_eq!(guest.files.get(STATE_PATH).unwrap(), "future-version\n");
+    assert!(!guest.commands.iter().any(|cmd| mutating(cmd)));
+}
+
+#[test]
 fn state_lookup_failure_prevents_mutation() {
     let mut guest = Guest::new();
     guest.failures.insert("if [ -e ".into(), 1);
@@ -257,6 +294,36 @@ fn slim_skips_removed_android_am_trim_memory_command() {
         .commands
         .iter()
         .any(|command| command == "am trim-memory --all COMPLETE"));
+}
+
+#[test]
+fn already_applied_state_skips_duplicate_slim_and_detects_reverted_setting() {
+    let (server, guest) = server(Guest::new());
+    slim(server.addr(), "emulator-5554", &options(false)).unwrap();
+    assert!(already_applied(server.addr(), "emulator-5554", &options(false)).unwrap());
+    let before = guest
+        .lock()
+        .unwrap()
+        .commands
+        .iter()
+        .filter(|cmd| mutating(cmd))
+        .count();
+    assert!(already_applied(server.addr(), "emulator-5554", &options(false)).unwrap());
+    assert_eq!(
+        guest
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .filter(|cmd| mutating(cmd))
+            .count(),
+        before
+    );
+    guest.lock().unwrap().settings.insert(
+        ("global".into(), "window_animation_scale".into()),
+        "1".into(),
+    );
+    assert!(!already_applied(server.addr(), "emulator-5554", &options(false)).unwrap());
 }
 
 #[test]
@@ -339,8 +406,20 @@ fn partial_restore_persists_only_unresolved_items_and_retry_skips_successes() {
     }
 
     restore(server.addr(), "emulator-5554").unwrap();
+    let before_noop = guest
+        .lock()
+        .unwrap()
+        .commands
+        .iter()
+        .filter(|cmd| mutating(cmd))
+        .count();
+    assert_eq!(restore(server.addr(), "emulator-5554").unwrap(), None);
     let guest = guest.lock().unwrap();
     assert!(!guest.files.contains_key(STATE_PATH));
+    assert_eq!(
+        guest.commands.iter().filter(|cmd| mutating(cmd)).count(),
+        before_noop
+    );
     assert_eq!(
         guest
             .commands

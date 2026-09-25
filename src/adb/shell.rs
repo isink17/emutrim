@@ -82,7 +82,15 @@ pub fn metadata(addr: SocketAddr, serial: &str) -> io::Result<DeviceMetadata> {
 }
 
 pub fn boot_completed(addr: SocketAddr, serial: &str) -> io::Result<bool> {
-    Ok(getprop(addr, serial, "sys.boot_completed")? == "1")
+    let output = shell_v2(addr, serial, "getprop sys.boot_completed")?;
+    if output.status != 0 {
+        return Err(io::Error::other(format!(
+            "boot check failed ({}): {}",
+            output.status,
+            output.stderr.trim()
+        )));
+    }
+    Ok(output.stdout.trim() == "1")
 }
 
 #[cfg(test)]
@@ -106,6 +114,18 @@ mod tests {
         let server = FakeAdb::start(|_| [frame(2, b"denied"), frame(3, &[7])].concat());
         let out = shell_v2(server.addr(), "emulator-5554", "false").unwrap();
         assert_eq!((out.status, out.stderr.as_str()), (7, "denied"));
+    }
+
+    #[test]
+    fn boot_check_uses_shell_v2_and_preserves_transport_errors() {
+        let server = FakeAdb::start(|command| {
+            assert_eq!(command, "getprop sys.boot_completed");
+            [frame(1, b"1\n"), frame(3, &[0])].concat()
+        });
+        assert!(boot_completed(server.addr(), "emulator-5556").unwrap());
+
+        let server = FakeAdb::start(|_| [frame(2, b"offline"), frame(3, &[1])].concat());
+        assert!(boot_completed(server.addr(), "emulator-5556").is_err());
     }
 
     #[test]
