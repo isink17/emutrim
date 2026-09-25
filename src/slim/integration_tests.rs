@@ -10,6 +10,7 @@ struct Guest {
     commands: Vec<String>,
     files: HashMap<String, String>,
     settings: BTreeMap<(String, String), String>,
+    disabled: BTreeSet<String>,
     failures: HashMap<String, usize>,
     fail_readback: bool,
     fail_canonical_readback: bool,
@@ -107,8 +108,12 @@ impl Guest {
                 .remove(&(args.next().unwrap().into(), args.next().unwrap().into()));
             String::new()
         } else if command.starts_with("pm disable-user ") {
+            self.disabled
+                .insert(command.split_whitespace().last().unwrap().into());
             "new state: disabled-user".into()
         } else if command.starts_with("pm enable ") {
+            self.disabled
+                .remove(command.split_whitespace().last().unwrap());
             "new state: enabled".into()
         } else {
             String::new()
@@ -264,22 +269,28 @@ fn partial_slim_stops_at_first_failed_package_and_keeps_recovery_record() {
     );
     let (server, guest) = server(guest);
     assert!(slim(server.addr(), "emulator-5554", &options(false)).is_err());
-    let guest = guest.lock().unwrap();
-    let state = guest.state().unwrap();
+    let snapshot = guest.lock().unwrap();
+    let state = snapshot.state().unwrap();
     assert!(state
         .disabled
         .contains(&"com.google.android.apps.maps".into()));
     assert!(state
         .disabled
         .contains(&"com.google.android.youtube".into()));
-    assert!(guest
+    assert!(snapshot
         .commands
         .iter()
         .any(|cmd| cmd == "pm disable-user --user 0 com.google.android.youtube"));
-    assert!(!guest
+    assert!(!snapshot
         .commands
         .iter()
         .any(|cmd| cmd.starts_with("settings put ") || cmd.starts_with("am ")));
+    drop(snapshot);
+
+    restore(server.addr(), "emulator-5554").unwrap();
+    let guest = guest.lock().unwrap();
+    assert!(guest.disabled.is_empty());
+    assert!(!guest.files.contains_key(STATE_PATH));
 }
 
 #[test]
