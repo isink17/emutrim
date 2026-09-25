@@ -245,6 +245,21 @@ fn dry_run_has_no_persistent_or_guest_mutation() {
 }
 
 #[test]
+fn slim_skips_removed_android_am_trim_memory_command() {
+    let (server, guest) = server(Guest::new());
+    assert_eq!(
+        slim(server.addr(), "emulator-5554", &options(false)).unwrap(),
+        2
+    );
+    assert!(!guest
+        .lock()
+        .unwrap()
+        .commands
+        .iter()
+        .any(|command| command == "am trim-memory --all COMPLETE"));
+}
+
+#[test]
 fn physical_or_suspicious_emulator_identity_is_never_mutated() {
     for (serial, qemu) in [("0123ABC", "0"), ("emulator-5554", "0")] {
         let mut guest = Guest::new();

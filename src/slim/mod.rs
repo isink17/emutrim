@@ -166,7 +166,6 @@ pub fn slim(addr: SocketAddr, serial: &str, options: &Options) -> io::Result<usi
         run(addr, serial, "cmd bluetooth_manager disable")?;
     }
     run(addr, serial, "am kill-all")?;
-    run(addr, serial, "am trim-memory --all COMPLETE")?;
     Ok(changed)
 }
 
