@@ -165,6 +165,16 @@ pub fn slim(addr: SocketAddr, serial: &str, options: &Options) -> io::Result<usi
     }
 
     let prior = read_state(addr, serial)?.unwrap_or_default();
+    let disabled = installed_packages(&run(addr, serial, "pm list packages -d")?);
+    if planned
+        .iter()
+        .any(|package| disabled.contains(package) && !prior.disabled.contains(package))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a planned package is already disabled outside EmuTrim state; refusing to overwrite its original state",
+        ));
+    }
     let mut state = prior.clone();
     for package in &planned {
         if !state.disabled.contains(package) {

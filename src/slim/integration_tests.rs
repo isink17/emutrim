@@ -12,6 +12,9 @@ struct Guest {
     settings: BTreeMap<(String, String), String>,
     disabled: BTreeSet<String>,
     failures: HashMap<String, usize>,
+    failures_after: HashMap<String, usize>,
+    disconnects: HashMap<String, usize>,
+    disconnect_before: HashMap<String, usize>,
     fail_readback: bool,
     fail_canonical_readback: bool,
     qemu: String,
@@ -33,6 +36,14 @@ impl Guest {
 
     fn handle(&mut self, command: &str) -> Vec<u8> {
         self.commands.push(command.into());
+        if let Some((_, remaining)) = self
+            .disconnect_before
+            .iter_mut()
+            .find(|(key, count)| **count > 0 && command.contains(key.as_str()))
+        {
+            *remaining -= 1;
+            return Vec::new();
+        }
         if let Some((_, remaining)) = self
             .failures
             .iter_mut()
@@ -123,6 +134,26 @@ impl Guest {
         } else {
             String::new()
         };
+        if let Some((_, remaining)) = self
+            .failures_after
+            .iter_mut()
+            .find(|(key, count)| **count > 0 && command.contains(key.as_str()))
+        {
+            *remaining -= 1;
+            return [
+                frame(2, b"response lost after guest operation"),
+                frame(3, &[1]),
+            ]
+            .concat();
+        }
+        if let Some((_, remaining)) = self
+            .disconnects
+            .iter_mut()
+            .find(|(key, count)| **count > 0 && command.contains(key.as_str()))
+        {
+            *remaining -= 1;
+            return Vec::new();
+        }
         [frame(1, stdout.as_bytes()), frame(3, &[0])].concat()
     }
 
@@ -208,6 +239,22 @@ fn unknown_existing_state_is_not_overwritten() {
     let guest = guest.lock().unwrap();
     assert_eq!(guest.files.get(STATE_PATH).unwrap(), "future-version\n");
     assert!(!guest.commands.iter().any(|cmd| mutating(cmd)));
+}
+
+#[test]
+fn pre_disabled_target_without_emutrim_state_is_preserved_and_refused() {
+    let mut guest = Guest::new();
+    guest.disabled.insert("com.google.android.apps.maps".into());
+    let (server, guest) = server(guest);
+
+    assert!(slim(server.addr(), "emulator-5554", &options(false)).is_err());
+    let guest = guest.lock().unwrap();
+    assert_eq!(
+        guest.disabled,
+        BTreeSet::from(["com.google.android.apps.maps".into()])
+    );
+    assert!(!guest.files.contains_key(STATE_PATH));
+    assert!(!guest.commands.iter().any(|command| mutating(command)));
 }
 
 #[test]
@@ -370,6 +417,137 @@ fn partial_slim_stops_at_first_failed_package_and_keeps_recovery_record() {
     drop(snapshot);
 
     restore(server.addr(), "emulator-5554").unwrap();
+    let guest = guest.lock().unwrap();
+    assert!(guest.disabled.is_empty());
+    assert!(!guest.files.contains_key(STATE_PATH));
+}
+
+#[test]
+fn interrupted_slim_after_persist_before_mutation_clears_noop_record() {
+    let mut guest = Guest::new();
+    guest.disconnect_before.insert("pm disable-user".into(), 1);
+    let (server, guest) = server(guest);
+    assert!(slim(server.addr(), "emulator-5554", &options(false)).is_err());
+    {
+        let guest = guest.lock().unwrap();
+        assert!(guest.disabled.is_empty());
+        assert!(guest.state().is_some());
+    }
+    restore(server.addr(), "emulator-5554").unwrap();
+    let guest = guest.lock().unwrap();
+    assert!(guest.disabled.is_empty());
+    assert!(!guest.files.contains_key(STATE_PATH));
+}
+
+#[test]
+fn interrupted_slim_after_packages_before_settings_restores_recorded_plan() {
+    let mut guest = Guest::new();
+    guest.failures_after.insert(
+        "pm disable-user --user 0 com.google.android.apps.maps".into(),
+        1,
+    );
+    let (server, guest) = server(guest);
+    assert!(slim(server.addr(), "emulator-5554", &options(false)).is_err());
+    assert_eq!(guest.lock().unwrap().disabled.len(), 2);
+    restore(server.addr(), "emulator-5554").unwrap();
+    let guest = guest.lock().unwrap();
+    assert!(guest.disabled.is_empty());
+    assert!(!guest.files.contains_key(STATE_PATH));
+}
+
+#[test]
+fn interrupted_slim_before_settings_restores_recorded_packages_and_settings() {
+    let mut guest = Guest::new();
+    guest.disconnects.insert("settings put".into(), 1);
+    let (server, guest) = server(guest);
+    assert!(slim(server.addr(), "emulator-5554", &options(false)).is_err());
+    {
+        let guest = guest.lock().unwrap();
+        assert_eq!(guest.disabled.len(), 2);
+        assert_eq!(
+            guest.settings.get(&("global".into(), "x".into())).unwrap(),
+            "old-x"
+        );
+    }
+    restore(server.addr(), "emulator-5554").unwrap();
+    let guest = guest.lock().unwrap();
+    assert!(guest.disabled.is_empty());
+    assert_eq!(
+        guest.settings.get(&("global".into(), "x".into())).unwrap(),
+        "old-x"
+    );
+    assert_eq!(
+        guest.settings.get(&("global".into(), "y".into())).unwrap(),
+        "old-y"
+    );
+    assert!(!guest.files.contains_key(STATE_PATH));
+}
+
+#[test]
+fn restore_post_operation_failure_keeps_retryable_checkpoint() {
+    let mut guest = Guest::new();
+    let state = State {
+        disabled: vec!["pkg.a".into(), "pkg.b".into()],
+        settings: BTreeMap::from([(("global".into(), "x".into()), Some("old-x".into()))]),
+    };
+    guest
+        .files
+        .insert(STATE_PATH.into(), crate::slim::state::encode(&state));
+    guest.disabled.extend(["pkg.a".into(), "pkg.b".into()]);
+    guest.failures_after.insert("pm enable pkg.a".into(), 1);
+    let (server, guest) = server(guest);
+
+    assert!(restore(server.addr(), "emulator-5554").is_err());
+    {
+        let guest = guest.lock().unwrap();
+        assert!(!guest.disabled.contains("pkg.a"));
+        assert_eq!(guest.state().unwrap().disabled, ["pkg.a"]);
+    }
+    restore(server.addr(), "emulator-5554").unwrap();
+    let guest = guest.lock().unwrap();
+    assert!(guest.disabled.is_empty());
+    assert_eq!(
+        guest.settings.get(&("global".into(), "x".into())).unwrap(),
+        "old-x"
+    );
+    assert!(!guest.files.contains_key(STATE_PATH));
+}
+
+#[test]
+fn interrupted_slim_after_all_guest_changes_keeps_valid_applied_state() {
+    let mut guest = Guest::new();
+    guest.disconnects.insert("am kill-all".into(), 1);
+    let (server, guest) = server(guest);
+
+    assert!(slim(server.addr(), "emulator-5554", &options(false)).is_err());
+    assert!(already_applied(server.addr(), "emulator-5554", &options(false)).unwrap());
+    restore(server.addr(), "emulator-5554").unwrap();
+    let guest = guest.lock().unwrap();
+    assert!(guest.disabled.is_empty());
+    assert_eq!(
+        guest.settings.get(&("global".into(), "x".into())).unwrap(),
+        "old-x"
+    );
+    assert_eq!(
+        guest.settings.get(&("global".into(), "y".into())).unwrap(),
+        "old-y"
+    );
+    assert!(!guest.files.contains_key(STATE_PATH));
+}
+
+#[test]
+fn restore_retries_cleanup_after_all_items_were_checkpointed() {
+    let mut guest = Guest::new();
+    guest.files.insert(
+        STATE_PATH.into(),
+        crate::slim::state::encode(&State::default()),
+    );
+    guest.disconnect_before.insert("rm -f".into(), 1);
+    let (server, guest) = server(guest);
+
+    assert!(restore(server.addr(), "emulator-5554").is_err());
+    assert_eq!(guest.lock().unwrap().state(), Some(State::default()));
+    assert_eq!(restore(server.addr(), "emulator-5554").unwrap(), Some(0));
     let guest = guest.lock().unwrap();
     assert!(guest.disabled.is_empty());
     assert!(!guest.files.contains_key(STATE_PATH));

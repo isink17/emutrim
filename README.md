@@ -29,7 +29,7 @@ Windows intentionally has no Android Studio shim: Android Studio launches `emula
 
 `slim` and the watcher require both an `emulator-*` transport and `ro.kernel.qemu=1`; physical devices are observed by the watcher but never mutated. They also require `sys.boot_completed=1`.
 
-The native standard profile excludes the Android 16+ boot-critical `com.google.android.bluetooth`. Before any package or setting change, EmuTrim writes and read-backs `/data/local/tmp/emutrim_state.v1` with the intended disabled packages and original setting values. If that fails, it makes no guest changes. `restore` changes only packages in that record and restores recorded settings; partial package failures retain the record for retry. Existing state is not an interoperability promise with other tools.
+The native standard profile excludes the Android 16+ boot-critical `com.google.android.bluetooth`. Before any package or setting change, EmuTrim writes and read-backs `/data/local/tmp/emutrim_state.v1` with the intended disabled packages and original setting values. A new plan refuses targets already disabled outside EmuTrim state, because the state format does not preserve their prior status. If state staging or preflight fails, EmuTrim makes no guest changes. `restore` changes only packages in that record and restores recorded settings; partial package failures retain the record for retry. Existing state is not an interoperability promise with other tools.
 
 `--dry-run` performs package discovery and prints only the planned package disables. It does not write guest state or invoke mutating shell commands.
 
@@ -44,6 +44,17 @@ Slim and restore were exercised for two cycles on a disposable Android 17 / API 
 ## v0.6 reconnect and restore
 
 Native `watch --serial` was verified across a cold restart of the same disposable AVD while another emulator remained connected. Watcher observed offline/disconnect, waited for framework boot, then verified persisted package/settings state and skipped duplicate mutations. The applied-state check detects reverted package/settings and falls through to slim; fake-server coverage verifies setting reversion. `restore` with no state is a successful no-op; unreadable or invalid existing state remains an error. Fake-server tests cover transient boot-check failures, bounded boot wait, duplicate snapshots, and later reconnect.
+
+## v0.7 recovery and image checks
+
+Deterministic fake-server tests cover interruption around persisted slim state, guest package/settings changes, per-item restore checkpoints, and retrying state cleanup. Persisted state contains the full intended package list and original settings before mutation; restore records each completed reversal and retries unresolved or ambiguous work. Android image acceptance:
+
+| Image | Page size | RAM | Slim | Restore | Reconnect |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Android 17 / API 37.2 Google APIs x86_64 | 16 KB | 4096 MB | 49 packages | exact settings and package restore; repeat no-op | live tested |
+| Android 12 / API 31 Android TV x86 | 4 KB | 1536 MB | 5 packages | exact settings and package restore; repeat no-op | not tested |
+
+The API 31 image has Android TV packages and no installed `com.google.android.bluetooth`; this is a narrow cross-image check, not general Android compatibility evidence. The API 37 long-offline startup observation remains undiagnosed; EmuTrim does not attempt emulator recovery.
 
 ## AVD configuration and 16 KB images
 
