@@ -6,6 +6,7 @@ Windows-first, zero-dependency Rust tooling for a running Android Emulator. It i
 
 - direct ADB smart-socket connections to `127.0.0.1:5037`; runtime ADB operations never spawn `adb.exe`
 - event-driven `host:track-devices` watching, cached metadata, reconnect handling, and no steady-state polling
+- optional target-scoped watching with `watch --serial=emulator-5556`
 - native `slim`, `restore`/`off`, and real dry-runs
 - Windows AVD discovery, conservative `tune-avd`, and direct `emulator.exe` launch via `start`
 
@@ -14,6 +15,7 @@ cargo build --release
 .\target\release\emutrim.exe tune-avd Pixel_API_35 --ram=1536
 .\target\release\emutrim.exe start Pixel_API_35 --ram=1536
 .\target\release\emutrim.exe watch
+.\target\release\emutrim.exe watch --serial=emulator-5554 --dry-run
 
 # Inspect only: no setting, package, state file, or memory command is changed.
 .\target\release\emutrim.exe slim --dry-run
@@ -34,6 +36,10 @@ The native standard profile excludes the Android 16+ boot-critical `com.google.a
 ## v0.3 failure-path checks
 
 `cargo test` exercises the production smart-socket client against a scripted loopback ADB server; no `adb.exe`, emulator, or device is required. Slimming stages state, reads it back, installs it, and verifies the saved record before the first guest mutation. Restore checkpoints completed reversals, keeping only unresolved work for retry. Malformed, truncated, or over-16-MiB shell-v2 output is rejected.
+
+## v0.5 live acceptance
+
+Slim and restore were exercised for two cycles on a disposable Android 17 / API 37.2 Google APIs x86_64 16 KB AVD while another emulator remained running. Explicit serial selection stayed on the requested emulator; each cycle disabled and restored 49 packages, restored original settings (including missing values), and removed its state record. A target-scoped dry-run watcher observed disconnect/reconnect without acting on the other emulator. This does not establish compatibility with other Android images. The scoped reconnect test used `--dry-run`.
 
 ## AVD configuration and 16 KB images
 

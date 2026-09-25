@@ -3,7 +3,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-type Handler = dyn Fn(&str) -> Vec<u8> + Send + Sync;
+type Handler = dyn Fn(&str, &str) -> Vec<u8> + Send + Sync;
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -20,18 +20,29 @@ pub(crate) struct FakeAdb {
 
 impl FakeAdb {
     pub(crate) fn start(handler: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> Self {
-        Self::start_mode(handler, Mode::Normal)
+        Self::start_mode(move |_, command| handler(command), Mode::Normal, "")
+    }
+
+    pub(crate) fn start_with_devices(
+        devices: &'static str,
+        handler: impl Fn(&str, &str) -> Vec<u8> + Send + Sync + 'static,
+    ) -> Self {
+        Self::start_mode(handler, Mode::Normal, devices)
     }
 
     pub(crate) fn rejecting_transport() -> Self {
-        Self::start_mode(|_| Vec::new(), Mode::RejectTransport)
+        Self::start_mode(|_, _| Vec::new(), Mode::RejectTransport, "")
     }
 
     pub(crate) fn closing_after_transport() -> Self {
-        Self::start_mode(|_| Vec::new(), Mode::CloseAfterTransport)
+        Self::start_mode(|_, _| Vec::new(), Mode::CloseAfterTransport, "")
     }
 
-    fn start_mode(handler: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static, mode: Mode) -> Self {
+    fn start_mode(
+        handler: impl Fn(&str, &str) -> Vec<u8> + Send + Sync + 'static,
+        mode: Mode,
+        devices: &'static str,
+    ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let handler: Arc<Handler> = Arc::new(handler);
@@ -40,7 +51,7 @@ impl FakeAdb {
             let Ok((stream, _)) = listener.accept() else {
                 break;
             };
-            serve(stream, &shared, mode);
+            serve(stream, &shared, mode, devices);
             if Arc::strong_count(&shared) == 1 {
                 break;
             }
@@ -59,7 +70,7 @@ impl FakeAdb {
 
 impl Drop for FakeAdb {
     fn drop(&mut self) {
-        self.handler = Arc::new(|_| Vec::new());
+        self.handler = Arc::new(|_, _| Vec::new());
         let _ = TcpStream::connect(self.addr);
         if let Some(thread) = self.thread.take() {
             thread.join().unwrap();
@@ -77,7 +88,7 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
     String::from_utf8(request).map_err(|_| std::io::ErrorKind::InvalidData.into())
 }
 
-fn serve(mut stream: TcpStream, handler: &Arc<Handler>, mode: Mode) {
+fn serve(mut stream: TcpStream, handler: &Arc<Handler>, mode: Mode, devices: &str) {
     let Ok(service) = read_request(&mut stream) else {
         return;
     };
@@ -85,7 +96,7 @@ fn serve(mut stream: TcpStream, handler: &Arc<Handler>, mode: Mode) {
         if stream.write_all(b"OKAY").is_err() {
             return;
         }
-        let body = b"";
+        let body = devices.as_bytes();
         let _ = write!(stream, "{:04x}", body.len());
         let _ = stream.write_all(body);
         return;
@@ -110,6 +121,7 @@ fn serve(mut stream: TcpStream, handler: &Arc<Handler>, mode: Mode) {
             }
         }
     }
+    let serial = service.trim_start_matches("host:transport:");
     let Ok(command) = read_request(&mut stream) else {
         return;
     };
@@ -119,7 +131,7 @@ fn serve(mut stream: TcpStream, handler: &Arc<Handler>, mode: Mode) {
     if stream.write_all(b"OKAY").is_err() {
         return;
     }
-    let bytes = handler(command.trim_start_matches("shell,v2,raw:"));
+    let bytes = handler(serial, command.trim_start_matches("shell,v2,raw:"));
     let _ = stream.write_all(&bytes);
 }
 

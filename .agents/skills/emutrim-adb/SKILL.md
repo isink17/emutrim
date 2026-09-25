@@ -11,5 +11,6 @@ description: Use when changing ADB transport, smart-socket framing, device track
 - Handle malformed, invalid, or truncated framing as errors. Add focused parser tests for protocol changes; verify partial reads and EOF behavior.
 - Bound accumulated shell-v2 output at 16 MiB; reject oversized frames before allocation. Exercise production framing with `src/adb/test_support.rs` loopback server.
 - Tracking is event-driven. Reconnect after stream loss without steady-state polling; keep shell requests on their own connections.
+- Explicit target selection is sticky: unrelated ADB transports must never influence or replace the selected device. Scoped watchers (`--serial`) must ignore every other transport and resume only for the selected serial after reconnect.
 - No runtime `adb.exe` subprocess fallback by default. Physical transports may be observed but must never reach guest mutation.
 - Use a local/mock TCP integration harness for service ordering, stream closure, and reconnect changes; never require a physical device for protocol tests.

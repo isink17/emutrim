@@ -16,6 +16,7 @@ use std::time::Duration;
 struct Config {
     adb_host: IpAddr,
     adb_port: u16,
+    serial: Option<String>,
     options: Options,
 }
 impl Config {
@@ -81,6 +82,7 @@ fn parse_config(args: Vec<String>) -> io::Result<Config> {
     let mut config = Config {
         adb_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
         adb_port: 5037,
+        serial: None,
         options: Options::default(),
     };
     for arg in args {
@@ -90,6 +92,13 @@ fn parse_config(args: Vec<String>) -> io::Result<Config> {
             config.adb_port = v
                 .parse()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid --adb-port"))?;
+        } else if let Some(v) = arg.strip_prefix("--serial=") {
+            if v.is_empty() || config.serial.replace(v.into()).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid --serial",
+                ));
+            }
         } else if let Some(v) = arg.strip_prefix("--keep=") {
             if v.is_empty() {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty --keep"));
@@ -109,7 +118,12 @@ fn parse_config(args: Vec<String>) -> io::Result<Config> {
                 config.options.skip.insert(group.into());
             }
         } else if !arg.starts_with('-') {
-            if config.options.keep.insert(format!("__serial__={arg}")) {}
+            if config.serial.replace(arg).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "multiple target serials",
+                ));
+            }
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -120,25 +134,16 @@ fn parse_config(args: Vec<String>) -> io::Result<Config> {
     Ok(config)
 }
 fn resolve(config: &mut Config) -> io::Result<String> {
-    let requested = config
-        .options
-        .keep
-        .iter()
-        .find_map(|v| v.strip_prefix("__serial__=").map(str::to_owned));
-    config
-        .options
-        .keep
-        .retain(|v| !v.starts_with("__serial__="));
     let mut tracker = Tracker::connect(config.adb_addr())?;
     let devices = tracker.next_snapshot()?;
     let emulators: Vec<_> = devices
         .into_iter()
         .filter(|d| d.state == "device" && d.serial.starts_with("emulator-"))
         .collect();
-    if let Some(serial) = requested {
+    if let Some(serial) = &config.serial {
         return emulators
             .into_iter()
-            .find(|d| d.serial == serial)
+            .find(|d| &d.serial == serial)
             .map(|d| d.serial)
             .ok_or_else(|| {
                 io::Error::new(
@@ -212,6 +217,7 @@ fn start(args: Vec<String>) -> io::Result<()> {
 }
 fn watch(config: Config) -> io::Result<()> {
     let addr = config.adb_addr();
+    let target = config.serial.clone();
     println!(
         "EmuTrim watcher\n  ADB server: {addr}\n  mode: {}",
         if config.options.dry_run {
@@ -220,7 +226,7 @@ fn watch(config: Config) -> io::Result<()> {
             "native slimming"
         }
     );
-    let mut previous = BTreeMap::new();
+    let mut previous = BTreeMap::<String, String>::new();
     let mut cache = HashMap::<String, DeviceMetadata>::new();
     let mut handled = HashSet::new();
     loop {
@@ -237,13 +243,18 @@ fn watch(config: Config) -> io::Result<()> {
                     };
                     let current = as_map(&snapshot);
                     for (serial, old) in &previous {
-                        if !current.contains_key(serial) {
+                        if watch_target_matches(target.as_deref(), serial)
+                            && !current.contains_key(serial)
+                        {
                             println!("- {serial} disconnected (was {old})");
                             cache.remove(serial);
                             handled.remove(serial);
                         }
                     }
                     for device in snapshot {
+                        if !watch_target_matches(target.as_deref(), &device.serial) {
+                            continue;
+                        }
                         if previous.get(&device.serial) == Some(&device.state) {
                             continue;
                         }
@@ -315,9 +326,99 @@ fn wait_for_boot(config: &Config, serial: &str, handled: &mut HashSet<String>) {
     }
     eprintln!("  timed out waiting for {serial} to finish booting");
 }
-fn print_help() {
-    println!("emutrim 0.2\n\nUsage:\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim watch [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim tune-avd [AVD] [--ram=1536]\n  emutrim start AVD [--ram=1536]\n  emutrim list-avds\n\nOnly verified emulator transports are mutated; no adb.exe subprocess is used.");
+fn watch_target_matches(target: Option<&str>, serial: &str) -> bool {
+    target.is_none_or(|target| target == serial)
 }
+fn print_help() {
+    println!("emutrim 0.2\n\nUsage:\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim watch [--serial=SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim tune-avd [AVD] [--ram=1536]\n  emutrim start AVD [--ram=1536]\n  emutrim list-avds\n\nOnly verified emulator transports are mutated; no adb.exe subprocess is used.");
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+    use crate::adb::test_support::{frame, FakeAdb};
+    use std::sync::{Arc, Mutex};
+
+    const TWO_EMULATORS: &str = "emulator-5554\tdevice\nemulator-5556\tdevice\n0123ABC\tdevice\n";
+
+    fn run_explicit(
+        serial: &str,
+        target_boot: &'static str,
+        other_boot: &'static str,
+    ) -> (io::Result<usize>, Vec<(String, String)>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let server = FakeAdb::start_with_devices(TWO_EMULATORS, move |serial, command| {
+            log.lock().unwrap().push((serial.into(), command.into()));
+            let out = match command {
+                "getprop ro.kernel.qemu" => "1",
+                "getprop sys.boot_completed" if serial == "emulator-5556" => target_boot,
+                "getprop sys.boot_completed" => other_boot,
+                "pm list packages" => "package:com.google.android.apps.maps\n",
+                _ => "",
+            };
+            [frame(1, out.as_bytes()), frame(3, &[0])].concat()
+        });
+        let mut config = parse_config(vec![serial.into(), "--dry-run".into()]).unwrap();
+        config.adb_port = server.addr().port();
+        let result = resolve(&mut config)
+            .and_then(|resolved| slim::slim(config.adb_addr(), &resolved, &config.options));
+        let calls = seen.lock().unwrap().clone();
+        (result, calls)
+    }
+
+    #[test]
+    fn explicit_target_stays_bound_when_other_emulator_has_opposite_boot_state() {
+        for (target, other) in [("1", "0"), ("0", "1")] {
+            let (result, calls) = run_explicit("emulator-5556", target, other);
+            assert_eq!(result.is_ok(), target == "1");
+            assert!(!calls.is_empty());
+            assert!(calls.iter().all(|(serial, _)| serial == "emulator-5556"));
+            if target == "1" {
+                assert!(calls
+                    .iter()
+                    .any(|(_, command)| command == "pm list packages"));
+            } else {
+                assert!(!calls
+                    .iter()
+                    .any(|(_, command)| command == "pm list packages"));
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_emulators_without_target_are_rejected() {
+        let server = FakeAdb::start_with_devices(TWO_EMULATORS, |_, _| Vec::new());
+        let mut config = parse_config(vec!["--dry-run".into()]).unwrap();
+        config.adb_port = server.addr().port();
+        assert_eq!(
+            resolve(&mut config).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn explicit_missing_or_physical_target_never_falls_back() {
+        for serial in ["emulator-5558", "0123ABC"] {
+            let server = FakeAdb::start_with_devices(TWO_EMULATORS, |_, _| Vec::new());
+            let mut config = parse_config(vec![serial.into()]).unwrap();
+            config.adb_port = server.addr().port();
+            assert!(resolve(&mut config).is_err());
+        }
+    }
+
+    #[test]
+    fn scoped_watcher_matches_only_requested_serial() {
+        assert!(watch_target_matches(Some("emulator-5556"), "emulator-5556"));
+        assert!(!watch_target_matches(
+            Some("emulator-5556"),
+            "emulator-5554"
+        ));
+        assert!(!watch_target_matches(Some("emulator-5556"), "0123ABC"));
+        assert!(watch_target_matches(None, "emulator-5554"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
