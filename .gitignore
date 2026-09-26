@@ -1,2 +1,5 @@
 /target
 .DS_Store
+.codegraph/*.sqlite
+.codegraph/*.sqlite-shm
+.codegraph/*.sqlite-wal
