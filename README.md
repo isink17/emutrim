@@ -1,20 +1,23 @@
 # EmuTrim
 
-Windows-first Rust tooling to reduce background work in Android Emulator images. Independent from [avdslim](https://github.com/kdbhalala/avdslim).
+Windows-first Rust tooling for Android Emulator startup, optimization, and diagnostics. EmuTrim is independent from [avdslim](https://github.com/kdbhalala/avdslim).
 
 ## Quick start
 
 ```powershell
 emutrim doctor
+emutrim list-avds
 emutrim start My_AVD
-emutrim start My_AVD --cold-boot
-emutrim start My_AVD --no-slim --timings
 ```
+
+EmuTrim launches the SDK's `emulator.exe` directly. It does not replace or shim Android Studio executables. Windows is the first-class platform; native process stats and integrated guest-mutating `start` are Windows-only.
 
 `start` validates the installed AVD and its RAM, launches `emulator.exe`, binds to the console/ADB port assigned for that launch, waits for that exact transport and Android boot, then slims it. If the AVD already has a verified applied profile, it makes no duplicate guest changes. `--no-slim` waits through boot and returns without guest mutation; `--timings` reports startup phases and composes with `--no-slim`. Use `--ram=N` to override configured RAM. `--cold-boot` bypasses Quick Boot for that launch (`-no-snapshot`); it does not wipe data or delete snapshot files.
 
 ```powershell
 emutrim doctor My_AVD [--serial=emulator-5556]
+emutrim start My_AVD --cold-boot
+emutrim start My_AVD --no-slim --timings
 emutrim stats emulator-5556 [--seconds=10]
 emutrim slim emulator-5556 --dry-run
 emutrim restore emulator-5556
@@ -24,7 +27,7 @@ emutrim list-avds
 
 `doctor` is read-only. It checks SDK/emulator availability, ADB reachability, installed AVDs, selected image/config/RAM, and an optional running target and saved state. It exits nonzero on material failures; warnings alone succeed. `stats` reports the Windows emulator process working set, private memory, CPU time/delta, threads, and handles when available. Sampling is read-only.
 
-If startup times out, EmuTrim reports the transport/boot phase and leaves the guest unchanged. It does not restart the emulator, wipe data, or delete snapshots. An offline or missing transport with a live emulator process is below the guest mutation path; inspect emulator logs or try Android Studio Cold Boot.
+If startup times out, EmuTrim reports the transport/boot phase and leaves the guest unchanged. It does not restart the emulator, wipe data, or delete snapshots. If an AVD remains offline during Quick Boot, retry with `emutrim start <AVD> --cold-boot`; this bypasses Quick Boot for one launch without deleting snapshots or wiping data.
 
 ## Safety and implementation
 

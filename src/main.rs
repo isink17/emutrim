@@ -42,6 +42,10 @@ fn run() -> io::Result<()> {
     let command = args.next().unwrap_or_else(|| "help".into());
     let args: Vec<_> = args.collect();
     match command.as_str() {
+        "--version" | "-V" => {
+            println!("emutrim {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "watch" => watch(parse_config(args)?),
         "slim" => {
             let mut config = parse_config(args)?;
@@ -1294,7 +1298,7 @@ fn watch_target_matches(target: Option<&str>, serial: &str) -> bool {
     target.is_none_or(|target| target == serial)
 }
 fn print_help() {
-    println!("emutrim\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL]\n  emutrim start <AVD> [--ram=N] [--no-slim] [--timings] [--cold-boot]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--ram=N]\n  emutrim list-avds\n\nstart launches and waits for Android boot, then slims unless --no-slim is set. --timings reports startup phases; --cold-boot bypasses Quick Boot for that launch.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.");
+    println!("emutrim {}\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL]\n  emutrim start <AVD> [--ram=N] [--no-slim] [--timings] [--cold-boot]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--ram=N]\n  emutrim list-avds\n  emutrim --version, -V\n\nstart launches and waits for Android boot, then slims unless --no-slim is set. --timings reports startup phases; --cold-boot bypasses Quick Boot for that launch.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.", env!("CARGO_PKG_VERSION"));
 }
 
 #[cfg(test)]
