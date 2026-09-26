@@ -1,6 +1,8 @@
 # EmuTrim
 
-Windows-first Rust tooling for Android Emulator startup, optimization, and diagnostics. EmuTrim is independent from [avdslim](https://github.com/kdbhalala/avdslim).
+Windows-first Rust tooling for Android Emulator startup, optimization, and diagnostics.
+
+Windows is the currently supported runtime platform. CI also builds and tests portable Rust code on Linux and macOS; this does not imply full feature support there.
 
 ## Quick start
 

@@ -27,6 +27,7 @@ Safety order: physical target refusal; resolved emulator identity; boot complete
 
 ## Git
 
+- Canonical branch: `master`. Do not create or migrate work to `main`.
 - Inspect status before and after. Preserve unrelated user changes.
 - Do not commit, push, or add attribution trailers unless explicitly requested.
 
