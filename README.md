@@ -45,6 +45,8 @@ These are specific disposable AVDs, not broad Android-version support claims.
 
 The Android 12 image has TV-specific packages and lacks `com.google.android.bluetooth`; package counts differ by image.
 
+API 37 benchmark used disposable `EmuTrim_API37_FreshControl_20260926`: Emulator 37.2.7.0 (package metadata references `android-sdk-preview-license`, so this is not a stable-build qualification), Platform-Tools 37.0.1, ADB server protocol 41, WHPX, image revision 5, 16 KB, 4096 MB, and gfxstream with host GLES/Vulkan. Each state used 120 seconds after boot/slim and three 10-second samples. Median working set was 4958.0 MB stock and 4947.3 MB slim (−10.7 MB, −0.22%); median private memory was 5663.6 MB stock and 5737.9 MB slim (+74.3 MB, +1.31%). Stock CPU samples varied; three samples do not establish a performance effect. A one-off channel-0 stable Emulator 37.1.11.0 also booted this AVD with the same host GPU, RAM, image, and ADB server in 35 seconds. This is a startup control, not a version comparison: AVD boot history differed and each build was observed once.
+
 ## Tests and local build
 
 ```powershell

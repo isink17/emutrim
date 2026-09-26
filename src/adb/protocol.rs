@@ -20,6 +20,19 @@ pub fn send_service(stream: &mut TcpStream, service: &str) -> io::Result<()> {
     read_status(stream)
 }
 
+pub fn host_protocol_version(addr: SocketAddr) -> io::Result<u32> {
+    let mut stream = connect(addr)?;
+    send_service(&mut stream, "host:version")?;
+    parse_host_protocol_version(&read_length_prefixed(&mut stream)?)
+}
+
+fn parse_host_protocol_version(payload: &[u8]) -> io::Result<u32> {
+    let version = std::str::from_utf8(payload)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ADB version is not UTF-8"))?;
+    u32::from_str_radix(version, 16)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ADB version is not hex"))
+}
+
 pub fn read_status<R: Read>(reader: &mut R) -> io::Result<()> {
     let mut status = [0u8; 4];
     reader.read_exact(&mut status)?;
@@ -85,5 +98,11 @@ mod tests {
         let mut input = Cursor::new(b"FAIL0004nope".to_vec());
         let err = read_status(&mut input).unwrap_err();
         assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn parses_host_protocol_version() {
+        assert_eq!(parse_host_protocol_version(b"0029").unwrap(), 41);
+        assert!(parse_host_protocol_version(b"bad!").is_err());
     }
 }

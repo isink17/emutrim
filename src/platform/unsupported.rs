@@ -1,5 +1,10 @@
 use super::ProcessStats;
 use std::io;
+use std::path::PathBuf;
+
+pub fn tcp_listener_image(_port: u16) -> io::Result<Option<(u32, PathBuf)>> {
+    Ok(None)
+}
 
 pub fn console_owner_pid(_port: u16) -> io::Result<Option<u32>> {
     Err(io::Error::new(

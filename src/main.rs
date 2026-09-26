@@ -413,6 +413,20 @@ fn doctor(args: Vec<String>) -> io::Result<()> {
         let emulator = sdk.join("emulator").join("emulator.exe");
         if emulator.is_file() {
             report_check("PASS", &format!("emulator.exe: {}", emulator.display()));
+            match std::fs::read_to_string(sdk.join("emulator").join("package.xml")) {
+                Ok(metadata) if emulator_uses_preview_license(&metadata) => report_check(
+                    "WARN",
+                    "emulator package metadata references preview license; stable channel not confirmed",
+                ),
+                Ok(_) => report_check(
+                    "INFO",
+                    "emulator channel is not stated by local package metadata",
+                ),
+                Err(error) => report_check(
+                    "WARN",
+                    &format!("emulator package metadata unavailable: {error}"),
+                ),
+            }
             match Command::new(&emulator).arg("-version").output() {
                 Ok(output) if output.status.success() => {
                     let version_output = if output.stdout.is_empty() {
@@ -444,6 +458,40 @@ fn doctor(args: Vec<String>) -> io::Result<()> {
                     devices.len()
                 ),
             );
+            match adb::protocol::host_protocol_version(default_adb_addr()) {
+                Ok(version) => report_check(
+                    "PASS",
+                    &format!("ADB server protocol: {version} (0x{version:04x})"),
+                ),
+                Err(error) => report_check("WARN", &format!("ADB server version: {error}")),
+            }
+            if let Some(sdk) = &sdk {
+                match platform::tcp_listener_image(5037) {
+                    Ok(Some((pid, path))) => {
+                        let expected = sdk.join("platform-tools").join("adb.exe");
+                        if path
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(&expected.to_string_lossy())
+                        {
+                            report_check(
+                                "PASS",
+                                &format!("ADB server listener: PID {pid}; {}", path.display()),
+                            );
+                        } else {
+                            report_check(
+                                "WARN",
+                                &format!(
+                                    "ADB server listener: PID {pid}; {} (differs from SDK adb {})",
+                                    path.display(),
+                                    expected.display()
+                                ),
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => report_check("WARN", &format!("ADB listener identity: {error}")),
+                }
+            }
             Some(devices)
         }
         Err(error) => {
@@ -534,6 +582,17 @@ fn doctor_exit(failures: usize) -> io::Result<()> {
             "doctor found {failures} material failure(s)"
         )))
     }
+}
+
+fn emulator_uses_preview_license(metadata: &str) -> bool {
+    let Some(start) = metadata.find("<localPackage path=\"emulator\"") else {
+        return false;
+    };
+    let package = &metadata[start..];
+    let Some(end) = package.find("</localPackage>") else {
+        return false;
+    };
+    package[..end].contains("android-sdk-preview-license")
 }
 
 fn report_check(status: &str, message: &str) {
@@ -718,6 +777,16 @@ mod cli_tests {
     fn doctor_warn_only_succeeds_but_material_failure_fails() {
         assert!(doctor_exit(0).is_ok());
         assert!(doctor_exit(1).is_err());
+    }
+
+    #[test]
+    fn detects_preview_license_only_on_emulator_package() {
+        assert!(emulator_uses_preview_license(
+            "<localPackage path=\"emulator\"><uses-license ref=\"android-sdk-preview-license\"/></localPackage>"
+        ));
+        assert!(!emulator_uses_preview_license(
+            "<localPackage path=\"other\"><uses-license ref=\"android-sdk-preview-license\"/></localPackage>"
+        ));
     }
 }
 

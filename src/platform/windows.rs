@@ -4,6 +4,8 @@ use std::ffi::c_void;
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::net::Ipv4Addr;
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::ptr;
 
 type Handle = *mut c_void;
@@ -15,6 +17,7 @@ const AF_INET: u32 = 2;
 const TCP_TABLE_OWNER_PID_LISTENER: u32 = 3;
 const MIB_TCP_STATE_LISTEN: u32 = 2;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
 #[repr(C)]
 struct TcpRowOwnerPid {
@@ -85,6 +88,12 @@ extern "system" {
     fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
     fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
     fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> Handle;
+    fn QueryFullProcessImageNameW(
+        process: Handle,
+        flags: u32,
+        exe_name: *mut u16,
+        size: *mut u32,
+    ) -> i32;
     fn GetProcessTimes(
         process: Handle,
         creation: *mut FileTime,
@@ -116,6 +125,31 @@ impl Drop for OwnedHandle {
 }
 
 pub fn console_owner_pid(port: u16) -> io::Result<Option<u32>> {
+    listener_owner_pid(port)
+}
+
+pub fn tcp_listener_image(port: u16) -> io::Result<Option<(u32, PathBuf)>> {
+    let Some(pid) = listener_owner_pid(port)? else {
+        return Ok(None);
+    };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let _process = OwnedHandle(process);
+    let mut path = vec![0u16; 32768];
+    let mut len = path.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut len) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    path.truncate(len as usize);
+    Ok(Some((
+        pid,
+        PathBuf::from(std::ffi::OsString::from_wide(&path)),
+    )))
+}
+
+fn listener_owner_pid(port: u16) -> io::Result<Option<u32>> {
     let mut size = 0;
     let result = unsafe {
         GetExtendedTcpTable(
@@ -170,7 +204,7 @@ pub fn console_owner_pid(port: u16) -> io::Result<Option<u32>> {
         [pid] => Ok(Some(*pid)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("console port {port} has multiple process owners"),
+            format!("TCP listener port {port} has multiple process owners"),
         )),
     }
 }
