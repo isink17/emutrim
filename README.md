@@ -7,9 +7,11 @@ Windows-first Rust tooling to reduce background work in Android Emulator images.
 ```powershell
 emutrim doctor
 emutrim start My_AVD
+emutrim start My_AVD --cold-boot
+emutrim start My_AVD --no-slim --timings
 ```
 
-`start` validates the installed AVD and its RAM, launches `emulator.exe`, binds to the console/ADB port assigned for that launch, waits for that exact transport and Android boot, then slims it. If the AVD already has a verified applied profile, it makes no duplicate guest changes. Use `--no-slim` for launch-only behavior, `--ram=N` to override configured RAM, or `--cold-boot` to bypass Quick Boot for that launch (`-no-snapshot`); it does not wipe data or delete snapshot files.
+`start` validates the installed AVD and its RAM, launches `emulator.exe`, binds to the console/ADB port assigned for that launch, waits for that exact transport and Android boot, then slims it. If the AVD already has a verified applied profile, it makes no duplicate guest changes. `--no-slim` waits through boot and returns without guest mutation; `--timings` reports startup phases and composes with `--no-slim`. Use `--ram=N` to override configured RAM. `--cold-boot` bypasses Quick Boot for that launch (`-no-snapshot`); it does not wipe data or delete snapshot files.
 
 ```powershell
 emutrim doctor My_AVD [--serial=emulator-5556]

@@ -1,11 +1,39 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
+    connect_with_timeout(addr, Duration::from_secs(3))
+}
+
+pub fn connect_with_timeout(addr: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    if timeout.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "ADB deadline expired",
+        ));
+    }
+    let stream = TcpStream::connect_timeout(&addr, timeout)?;
     stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     Ok(stream)
+}
+
+pub fn connect_until(addr: SocketAddr, deadline: Instant) -> io::Result<TcpStream> {
+    connect_with_timeout(addr, remaining_until(deadline)?)
+}
+
+pub fn remaining_until(deadline: Instant) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "startup deadline expired",
+        ))
+    } else {
+        Ok(remaining)
+    }
 }
 
 pub fn encode_request(service: &str) -> Vec<u8> {
@@ -17,6 +45,18 @@ pub fn encode_request(service: &str) -> Vec<u8> {
 pub fn send_service(stream: &mut TcpStream, service: &str) -> io::Result<()> {
     stream.write_all(&encode_request(service))?;
     stream.flush()?;
+    read_status(stream)
+}
+
+pub fn send_service_until(
+    stream: &mut TcpStream,
+    service: &str,
+    deadline: Instant,
+) -> io::Result<()> {
+    stream.set_write_timeout(Some(remaining_until(deadline)?))?;
+    stream.write_all(&encode_request(service))?;
+    stream.flush()?;
+    stream.set_read_timeout(Some(remaining_until(deadline)?))?;
     read_status(stream)
 }
 
@@ -68,6 +108,23 @@ pub fn read_length_prefixed<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
+pub fn read_length_prefixed_until(
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    stream.set_read_timeout(Some(remaining_until(deadline)?))?;
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len_str = std::str::from_utf8(&len_buf)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ADB length is not UTF-8 hex"))?;
+    let len = usize::from_str_radix(len_str, 16)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ADB length is not valid hex"))?;
+    let mut payload = vec![0u8; len];
+    stream.set_read_timeout(Some(remaining_until(deadline)?))?;
+    stream.read_exact(&mut payload)?;
+    Ok(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +161,23 @@ mod tests {
     fn parses_host_protocol_version() {
         assert_eq!(parse_host_protocol_version(b"0029").unwrap(), 41);
         assert!(parse_host_protocol_version(b"bad!").is_err());
+    }
+
+    #[test]
+    fn deadline_remaining_is_bounded_and_expiry_is_reported() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let remaining = remaining_until(deadline).unwrap();
+        assert!(!remaining.is_zero());
+        assert!(remaining <= Duration::from_secs(2));
+        assert_eq!(
+            remaining_until(Instant::now()).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            connect_with_timeout("127.0.0.1:5037".parse().unwrap(), Duration::ZERO)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
     }
 }

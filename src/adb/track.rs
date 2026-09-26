@@ -1,4 +1,7 @@
-use crate::adb::protocol::{connect, read_length_prefixed, send_service};
+use crate::adb::protocol::{
+    connect, connect_until, read_length_prefixed, read_length_prefixed_until, send_service,
+    send_service_until,
+};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{SocketAddr, TcpStream};
@@ -30,6 +33,15 @@ pub fn devices(addr: SocketAddr) -> io::Result<Vec<DeviceState>> {
     let mut stream = connect(addr)?;
     send_service(&mut stream, "host:devices-l")?;
     parse_snapshot(&read_length_prefixed(&mut stream)?)
+}
+
+pub fn devices_with_timeout(
+    addr: SocketAddr,
+    deadline: std::time::Instant,
+) -> io::Result<Vec<DeviceState>> {
+    let mut stream = connect_until(addr, deadline)?;
+    send_service_until(&mut stream, "host:devices-l", deadline)?;
+    parse_snapshot(&read_length_prefixed_until(&mut stream, deadline)?)
 }
 
 pub fn parse_snapshot(payload: &[u8]) -> io::Result<Vec<DeviceState>> {
@@ -64,6 +76,11 @@ pub fn as_map(snapshot: &[DeviceState]) -> BTreeMap<String, String> {
 mod tests {
     use super::*;
     use crate::adb::test_support::FakeAdb;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn parses_emulator_snapshot() {
@@ -105,5 +122,29 @@ mod tests {
                 state: "offline".into()
             }]
         );
+    }
+
+    #[test]
+    fn device_snapshot_read_obeys_startup_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0; 4];
+            stream.read_exact(&mut header).unwrap();
+            let len = usize::from_str_radix(std::str::from_utf8(&header).unwrap(), 16).unwrap();
+            let mut request = vec![0; len];
+            stream.read_exact(&mut request).unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let result = devices_with_timeout(addr, Instant::now() + Duration::from_millis(50));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
     }
 }

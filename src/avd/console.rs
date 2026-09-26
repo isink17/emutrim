@@ -2,12 +2,27 @@ use std::env;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-fn response(reader: &mut BufReader<TcpStream>) -> io::Result<Vec<String>> {
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "emulator console deadline expired",
+        ))
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn response(reader: &mut BufReader<TcpStream>, deadline: Instant) -> io::Result<Vec<String>> {
     let mut lines = Vec::new();
     let mut total = 0usize;
     loop {
+        reader
+            .get_mut()
+            .set_read_timeout(Some(remaining(deadline)?))?;
         let mut line = String::new();
         let read = reader.read_line(&mut line)?;
         if read == 0 {
@@ -57,12 +72,16 @@ fn parse_avd_name(lines: Vec<String>) -> io::Result<String> {
 }
 
 pub fn avd_name(port: u16) -> io::Result<String> {
+    avd_name_until(port, Instant::now() + Duration::from_secs(2))
+}
+
+pub fn avd_name_until(port: u16, deadline: Instant) -> io::Result<String> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let stream = TcpStream::connect_timeout(&address, remaining(deadline)?)?;
+    stream.set_read_timeout(Some(remaining(deadline)?))?;
+    stream.set_write_timeout(Some(remaining(deadline)?))?;
     let mut reader = BufReader::new(stream);
-    let greeting = response(&mut reader)?;
+    let greeting = response(&mut reader, deadline)?;
     if greeting
         .iter()
         .any(|line| line.contains("Authentication required"))
@@ -75,11 +94,17 @@ pub fn avd_name(port: u16) -> io::Result<String> {
                 "emulator console authentication token is empty",
             ));
         }
+        reader
+            .get_mut()
+            .set_write_timeout(Some(remaining(deadline)?))?;
         writeln!(reader.get_mut(), "auth {token}")?;
-        let _ = response(&mut reader)?;
+        let _ = response(&mut reader, deadline)?;
     }
+    reader
+        .get_mut()
+        .set_write_timeout(Some(remaining(deadline)?))?;
     writeln!(reader.get_mut(), "avd name")?;
-    parse_avd_name(response(&mut reader)?)
+    parse_avd_name(response(&mut reader, deadline)?)
 }
 
 #[cfg(test)]

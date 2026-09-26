@@ -3,8 +3,12 @@ mod avd;
 mod platform;
 mod slim;
 
-use adb::shell::{boot_completed, metadata, shell_v2, DeviceMetadata};
-use adb::track::{as_map, devices, DeviceState, Tracker};
+use adb::protocol::remaining_until;
+use adb::shell::{
+    boot_completed, boot_completed_with_timeout, metadata, shell_v2, shell_v2_with_timeout,
+    DeviceMetadata,
+};
+use adb::track::{as_map, devices, devices_with_timeout, DeviceState, Tracker};
 use slim::Options;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -215,12 +219,6 @@ fn tune(args: Vec<String>) -> io::Result<()> {
 }
 fn start(args: Vec<String>) -> io::Result<()> {
     let (name, requested_ram, no_slim, timings, cold_boot) = start_args(args)?;
-    if no_slim && timings {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--timings requires integrated start; remove --no-slim",
-        ));
-    }
     let info = avd::inspect(&name)?;
     let ram = requested_ram.unwrap_or(info.ram_mb);
     avd::validate_ram(&info, ram)?;
@@ -249,32 +247,40 @@ fn start(args: Vec<String>) -> io::Result<()> {
     };
     let launch_pid = child.id();
     println!("started {name} as {serial}");
-    if no_slim {
-        return Ok(());
-    }
-
     println!("waiting for ADB transport...");
+    let transport_deadline = Instant::now() + Duration::from_secs(120);
     let ready = wait_for_transport_with(
         &serial,
-        240,
-        || devices(default_adb_addr()),
-        || match platform::console_owner_pid(port)? {
-            Some(owner) => Ok(Some(platform::belongs_to_launch(owner, launch_pid)?)),
-            None => Ok(None),
-        },
+        transport_deadline,
+        |deadline| devices_with_timeout(default_adb_addr(), deadline),
         || {
+            if no_slim {
+                Ok(Some(true))
+            } else {
+                match platform::console_owner_pid(port)? {
+                    Some(owner) => Ok(Some(platform::belongs_to_launch(owner, launch_pid)?)),
+                    None => Ok(None),
+                }
+            }
+        },
+        |deadline| {
             let running = child.try_wait().map(|status| status.is_none())?;
-            let console =
-                timings && avd::console::avd_name(port).is_ok_and(|actual| actual == name);
+            let console = timings
+                && remaining_until(deadline).is_ok()
+                && avd::console::avd_name_until(port, deadline).is_ok_and(|actual| actual == name);
             Ok((running, console))
         },
-        || thread::sleep(Duration::from_millis(500)),
+        |remaining| thread::sleep(remaining.min(Duration::from_millis(500))),
         &mut timing,
     )?;
     if timings && timing.console.is_none() {
+        eprintln!("startup timing: {}", timing.format());
         return Err(console_timeout_error(&name));
     }
     if !ready {
+        if timings {
+            eprintln!("startup timing: {}", timing.format());
+        }
         return Err(transport_timeout_error(
             &serial,
             child.try_wait()?.is_none(),
@@ -282,7 +288,12 @@ fn start(args: Vec<String>) -> io::Result<()> {
             timing.error.as_deref(),
         ));
     }
-    let qemu = shell_v2(default_adb_addr(), &serial, "getprop ro.kernel.qemu")?;
+    let qemu = shell_v2_with_timeout(
+        default_adb_addr(),
+        &serial,
+        "getprop ro.kernel.qemu",
+        Instant::now() + Duration::from_secs(3),
+    )?;
     if qemu.status != 0 || !slim::is_emulator(&serial, &qemu.stdout) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -290,40 +301,55 @@ fn start(args: Vec<String>) -> io::Result<()> {
         ));
     }
 
-    println!("waiting for Android boot...");
+    if timings {
+        println!("ADB transport ready: {serial} device; waiting for Android boot...");
+    } else {
+        println!("waiting for Android boot...");
+    }
+    let boot_deadline = Instant::now() + Duration::from_secs(120);
     let mut action = None;
-    let boot_result = wait_for_boot_checked(
+    let boot_result = wait_for_boot_until(
         &serial,
-        240,
-        || {
-            let result = boot_completed(default_adb_addr(), &serial);
+        boot_deadline,
+        |deadline| {
+            let result = boot_completed_with_timeout(default_adb_addr(), &serial, deadline);
             if matches!(&result, Ok(true)) {
                 timing.boot = Some(Instant::now());
             }
             result
         },
         || child.try_wait().map(|status| status.is_none()),
-        || thread::sleep(Duration::from_millis(500)),
+        |remaining| thread::sleep(remaining.min(Duration::from_millis(500))),
         || {
-            action = Some(match slim_after_boot(default_adb_addr(), &serial) {
-                Ok(SlimResult::AlreadyApplied) => {
-                    println!("already slimmed; no guest changes needed");
-                    Ok(())
+            action = Some(if no_slim {
+                Ok(())
+            } else {
+                match slim_after_boot(default_adb_addr(), &serial) {
+                    Ok(SlimResult::AlreadyApplied) => {
+                        println!("already slimmed; no guest changes needed");
+                        Ok(())
+                    }
+                    Ok(SlimResult::Slimmed(count)) => {
+                        println!("slimmed {count} package(s)");
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
                 }
-                Ok(SlimResult::Slimmed(count)) => {
-                    println!("slimmed {count} package(s)");
-                    Ok(())
-                }
-                Err(error) => Err(error),
             });
         },
     );
     match boot_result? {
         BootWait::Ready => {}
         BootWait::TimedOut => {
+            if timings {
+                eprintln!("startup timing: {}", timing.format());
+            }
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("Android boot timed out on {serial}; guest was not modified"),
+                format!(
+                    "Android boot timed out on {serial}; last state: {} (boot incomplete); guest was not modified",
+                    timing.state.as_deref().unwrap_or("absent")
+                ),
             ));
         }
         BootWait::ProcessExited => {
@@ -335,6 +361,9 @@ fn start(args: Vec<String>) -> io::Result<()> {
     }
     let result =
         action.unwrap_or_else(|| Err(io::Error::other("boot completed without start action")));
+    if no_slim && result.is_ok() {
+        println!("guest was not modified");
+    }
     if result.is_ok() && timings {
         timing.ready = Some(Instant::now());
         println!("startup timing: {}", timing.format());
@@ -378,14 +407,19 @@ impl StartupTiming {
 
     fn format(&self) -> String {
         let launched = self.launched;
+        let ended = self.ready.or_else(|| (self.capture).then(Instant::now));
         format!(
             "launch→console {}; console→ADB {}; ADB→device {}; device→boot {}; boot→ready {}; total {}",
             self.elapsed(launched, self.console),
             self.elapsed(self.console, self.transport),
             self.elapsed(self.transport, self.device),
             self.elapsed(self.device, self.boot),
-            self.elapsed(self.boot, self.ready),
-            match (launched, self.ready) {
+            if self.ready.is_some() {
+                self.elapsed(self.boot, self.ready)
+            } else {
+                "n/a".into()
+            },
+            match (launched, ended) {
                 (Some(start), Some(end)) => format!("{:.1}s", end.duration_since(start).as_secs_f64()),
                 _ => "n/a".into(),
             }
@@ -916,34 +950,36 @@ fn stats_args(args: Vec<String>) -> io::Result<(String, u64)> {
 
 fn wait_for_transport_with(
     serial: &str,
-    attempts: usize,
-    mut snapshot: impl FnMut() -> io::Result<Vec<DeviceState>>,
+    deadline: Instant,
+    mut snapshot: impl FnMut(Instant) -> io::Result<Vec<DeviceState>>,
     mut owns_port: impl FnMut() -> io::Result<Option<bool>>,
-    mut process_and_console: impl FnMut() -> io::Result<(bool, bool)>,
-    mut pause: impl FnMut(),
+    mut process_and_console: impl FnMut(Instant) -> io::Result<(bool, bool)>,
+    mut pause: impl FnMut(Duration),
     timing: &mut StartupTiming,
 ) -> io::Result<bool> {
-    for _ in 0..attempts {
-        match snapshot() {
+    loop {
+        match remaining_until(deadline) {
+            Ok(_) => {}
+            Err(_) => return Ok(false),
+        }
+        match snapshot(deadline) {
             Ok(devices) => {
                 timing.error = None;
-                if let Some(state) = devices
+                let state = devices
                     .iter()
                     .find(|device| device.serial == serial)
-                    .map(|device| device.state.clone())
-                {
-                    timing.state = Some(state);
-                    if timing.capture {
-                        timing.transport.get_or_insert_with(Instant::now);
-                        if timing.state.as_deref() == Some("device") {
-                            timing.device.get_or_insert_with(Instant::now);
-                        }
+                    .map(|device| device.state.clone());
+                timing.state = state.clone();
+                if state.is_some() && timing.capture {
+                    timing.transport.get_or_insert_with(Instant::now);
+                    if timing.state.as_deref() == Some("device") {
+                        timing.device.get_or_insert_with(Instant::now);
                     }
                 }
             }
             Err(error) => timing.error = Some(error.to_string()),
         }
-        let (process_running, console_ready) = process_and_console()?;
+        let (process_running, console_ready) = process_and_console(deadline)?;
         if !process_running {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -954,8 +990,16 @@ fn wait_for_transport_with(
             timing.console = Some(Instant::now());
         }
         if timing.state.as_deref() == Some("device") {
+            if remaining_until(deadline).is_err() {
+                return Ok(false);
+            }
             match owns_port()? {
-                Some(true) if !timing.capture || timing.console.is_some() => return Ok(true),
+                Some(true) if !timing.capture || timing.console.is_some() => {
+                    if remaining_until(deadline).is_err() {
+                        return Ok(false);
+                    }
+                    return Ok(true);
+                }
                 Some(true) => {}
                 Some(false) => {
                     return Err(io::Error::new(
@@ -966,9 +1010,12 @@ fn wait_for_transport_with(
                 None => {}
             }
         }
-        pause();
+        let remaining = match remaining_until(deadline) {
+            Ok(remaining) => remaining,
+            Err(_) => return Ok(false),
+        };
+        pause(remaining.min(Duration::from_millis(500)));
     }
-    Ok(false)
 }
 
 fn transport_timeout_error(
@@ -1195,11 +1242,59 @@ fn wait_for_boot_checked(
     }
     Ok(BootWait::TimedOut)
 }
+
+fn wait_for_boot_until(
+    serial: &str,
+    deadline: Instant,
+    mut check: impl FnMut(Instant) -> io::Result<bool>,
+    mut process_running: impl FnMut() -> io::Result<bool>,
+    mut pause: impl FnMut(Duration),
+    on_ready: impl FnOnce(),
+) -> io::Result<BootWait> {
+    let mut first_error = None;
+    loop {
+        if remaining_until(deadline).is_err() {
+            break;
+        }
+        if !process_running()? {
+            return Ok(BootWait::ProcessExited);
+        }
+        let result = check(deadline);
+        if remaining_until(deadline).is_err() {
+            break;
+        }
+        match result {
+            Ok(true) => {
+                on_ready();
+                return Ok(BootWait::Ready);
+            }
+            Ok(false) => {}
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err.to_string());
+                }
+            }
+        }
+        let remaining = match remaining_until(deadline) {
+            Ok(remaining) => remaining,
+            Err(_) => break,
+        };
+        pause(remaining.min(Duration::from_millis(500)));
+    }
+    if let Some(err) = first_error {
+        eprintln!(
+            "  timed out waiting for {serial} to finish booting; last boot-check error: {err}"
+        );
+    } else {
+        eprintln!("  timed out waiting for {serial} to finish booting");
+    }
+    Ok(BootWait::TimedOut)
+}
 fn watch_target_matches(target: Option<&str>, serial: &str) -> bool {
     target.is_none_or(|target| target == serial)
 }
 fn print_help() {
-    println!("emutrim\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL]\n  emutrim start <AVD> [--ram=N] [--no-slim] [--timings]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--ram=N]\n  emutrim list-avds\n\nstart launches, waits for Android boot, then slims. --no-slim launches only; --timings reports successful integrated-start phases.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.");
+    println!("emutrim\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL]\n  emutrim start <AVD> [--ram=N] [--no-slim] [--timings] [--cold-boot]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--ram=N]\n  emutrim list-avds\n\nstart launches and waits for Android boot, then slims unless --no-slim is set. --timings reports startup phases; --cold-boot bypasses Quick Boot for that launch.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.");
 }
 
 #[cfg(test)]
@@ -1532,6 +1627,41 @@ mod start_tests {
     }
 
     #[test]
+    fn start_flags_compose_independently_and_in_any_order() {
+        for (flags, no_slim, timings, cold_boot) in [
+            (vec![], false, false, false),
+            (vec!["--timings"], false, true, false),
+            (vec!["--no-slim"], true, false, false),
+            (vec!["--no-slim", "--timings"], true, true, false),
+            (vec!["--cold-boot"], false, false, true),
+            (vec!["--cold-boot", "--timings"], false, true, true),
+            (vec!["--no-slim", "--cold-boot"], true, false, true),
+            (
+                vec!["--no-slim", "--cold-boot", "--timings"],
+                true,
+                true,
+                true,
+            ),
+        ] {
+            let mut args = vec!["Test_AVD".to_owned()];
+            args.extend(flags.into_iter().map(str::to_owned));
+            let parsed = start_args(args).unwrap();
+            assert_eq!(
+                (parsed.2, parsed.3, parsed.4),
+                (no_slim, timings, cold_boot)
+            );
+        }
+        let parsed = start_args(vec![
+            "Test_AVD".into(),
+            "--timings".into(),
+            "--cold-boot".into(),
+            "--no-slim".into(),
+        ])
+        .unwrap();
+        assert_eq!((parsed.2, parsed.3, parsed.4), (true, true, true));
+    }
+
+    #[test]
     fn startup_timing_formats_deterministic_phases() {
         let base = Instant::now();
         let timing = StartupTiming {
@@ -1580,11 +1710,11 @@ mod start_tests {
         let mut timing = StartupTiming::default();
         assert!(wait_for_transport_with(
             "emulator-5558",
-            3,
-            move || Ok(source.lock().unwrap().pop_front().unwrap_or_default()),
+            Instant::now() + Duration::from_secs(5),
+            move |_| Ok(source.lock().unwrap().pop_front().unwrap_or_default()),
             move || Ok(owner_source.lock().unwrap().pop_front().unwrap_or(None)),
-            || Ok((true, false)),
-            || {},
+            |_| Ok((true, false)),
+            |_| {},
             &mut timing,
         )
         .unwrap());
@@ -1602,11 +1732,11 @@ mod start_tests {
         };
         assert!(wait_for_transport_with(
             "emulator-5558",
-            3,
-            || Ok(vec![device("emulator-5558", "device")]),
+            Instant::now() + Duration::from_secs(5),
+            |_| Ok(vec![device("emulator-5558", "device")]),
             || Ok(Some(true)),
-            move || Ok((true, probe.lock().unwrap().pop_front().unwrap())),
-            || {},
+            move |_| Ok((true, probe.lock().unwrap().pop_front().unwrap())),
+            |_| {},
             &mut timing,
         )
         .unwrap());
@@ -1628,34 +1758,131 @@ mod start_tests {
         let mut timing = StartupTiming::default();
         assert!(!wait_for_transport_with(
             "emulator-5558",
-            2,
-            || Ok(Vec::new()),
+            Instant::now(),
+            |_| Ok(Vec::new()),
             || Ok(None),
-            || Ok((true, false)),
-            || {},
+            |_| Ok((true, false)),
+            |_| {},
             &mut timing,
         )
         .unwrap());
         assert!(wait_for_transport_with(
             "emulator-5558",
-            1,
-            || Ok(vec![device("emulator-5558", "device")]),
+            Instant::now() + Duration::from_secs(5),
+            |_| Ok(vec![device("emulator-5558", "device")]),
             || Ok(Some(false)),
-            || Ok((true, false)),
-            || {},
+            |_| Ok((true, false)),
+            |_| {},
             &mut timing,
         )
         .is_err());
         assert!(wait_for_transport_with(
             "emulator-5558",
-            1,
-            || Ok(Vec::new()),
+            Instant::now() + Duration::from_secs(5),
+            |_| Ok(Vec::new()),
             || Ok(None),
-            || Ok((false, false)),
-            || {},
+            |_| Ok((false, false)),
+            |_| {},
             &mut timing,
         )
         .is_err());
+    }
+
+    #[test]
+    fn transport_timeout_diagnostic_distinguishes_state_and_server() {
+        assert!(transport_timeout_error("emulator-5554", true, None, None)
+            .to_string()
+            .contains("transport is absent"));
+        assert!(
+            transport_timeout_error("emulator-5554", true, Some("offline"), None)
+                .to_string()
+                .contains("stayed offline")
+        );
+        assert!(
+            transport_timeout_error("emulator-5554", true, None, Some("refused"))
+                .to_string()
+                .contains("ADB server unavailable")
+        );
+    }
+
+    #[test]
+    fn deadline_boot_wait_checks_immediately_and_respects_expiry() {
+        let mut ready_called = false;
+        let result = wait_for_boot_until(
+            "emulator-5554",
+            Instant::now() + Duration::from_secs(1),
+            |_| Ok(true),
+            || Ok(true),
+            |_| panic!("ready must not sleep"),
+            || ready_called = true,
+        )
+        .unwrap();
+        assert_eq!(result, BootWait::Ready);
+        assert!(ready_called);
+
+        assert_eq!(
+            wait_for_boot_until(
+                "emulator-5554",
+                Instant::now(),
+                |_| panic!("expired deadline must not check"),
+                || Ok(true),
+                |_| {},
+                || {},
+            )
+            .unwrap(),
+            BootWait::TimedOut
+        );
+    }
+
+    #[test]
+    fn transport_wait_handles_late_server_and_offline_to_device() {
+        let snapshots = Arc::new(Mutex::new(VecDeque::from([
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "server not started",
+            )),
+            Ok(Vec::new()),
+            Ok(vec![device("emulator-5554", "offline")]),
+            Ok(vec![device("emulator-5554", "device")]),
+        ])));
+        let source = snapshots.clone();
+        let mut timing = StartupTiming {
+            capture: true,
+            ..StartupTiming::default()
+        };
+        assert!(wait_for_transport_with(
+            "emulator-5554",
+            Instant::now() + Duration::from_secs(1),
+            move |_| source.lock().unwrap().pop_front().unwrap(),
+            || Ok(Some(true)),
+            |_| Ok((true, true)),
+            |_| {},
+            &mut timing,
+        )
+        .unwrap());
+        assert_eq!(timing.state.as_deref(), Some("device"));
+        assert!(timing.transport.is_some());
+        assert!(timing.device.is_some());
+    }
+
+    #[test]
+    fn boot_wait_handles_incomplete_then_ready() {
+        let checks = Arc::new(Mutex::new(VecDeque::from([Ok(false), Ok(true)])));
+        let source = checks.clone();
+        let mut ready_called = false;
+        assert_eq!(
+            wait_for_boot_until(
+                "emulator-5554",
+                Instant::now() + Duration::from_secs(1),
+                move |_| source.lock().unwrap().pop_front().unwrap(),
+                || Ok(true),
+                |_| {},
+                || ready_called = true,
+            )
+            .unwrap(),
+            BootWait::Ready
+        );
+        assert!(ready_called);
     }
 
     #[test]

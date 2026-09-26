@@ -1,6 +1,9 @@
-use crate::adb::protocol::{connect, send_service};
+use crate::adb::protocol::{
+    connect, connect_until, remaining_until, send_service, send_service_until,
+};
 use std::io::{self, Read};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
+use std::time::Instant;
 
 const MAX_SHELL_OUTPUT: usize = 16 * 1024 * 1024;
 
@@ -34,9 +37,31 @@ pub fn shell_v2(addr: SocketAddr, serial: &str, command: &str) -> io::Result<She
     let mut stream = connect(addr)?;
     send_service(&mut stream, &format!("host:transport:{serial}"))?;
     send_service(&mut stream, &format!("shell,v2,raw:{command}"))?;
+    read_shell_v2(&mut stream, |_| Ok(()))
+}
+
+pub fn shell_v2_with_timeout(
+    addr: SocketAddr,
+    serial: &str,
+    command: &str,
+    deadline: Instant,
+) -> io::Result<ShellOutput> {
+    let mut stream = connect_until(addr, deadline)?;
+    send_service_until(&mut stream, &format!("host:transport:{serial}"), deadline)?;
+    send_service_until(&mut stream, &format!("shell,v2,raw:{command}"), deadline)?;
+    read_shell_v2(&mut stream, |stream| {
+        stream.set_read_timeout(Some(remaining_until(deadline)?))
+    })
+}
+
+fn read_shell_v2(
+    stream: &mut TcpStream,
+    mut before_read: impl FnMut(&mut TcpStream) -> io::Result<()>,
+) -> io::Result<ShellOutput> {
     let mut out = ShellOutput::default();
     let mut received = 0usize;
     loop {
+        before_read(stream)?;
         let mut header = [0u8; 5];
         stream.read_exact(&mut header)?;
         let len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
@@ -50,6 +75,7 @@ pub fn shell_v2(addr: SocketAddr, serial: &str, command: &str) -> io::Result<She
             ));
         }
         let mut payload = vec![0; len];
+        before_read(stream)?;
         stream.read_exact(&mut payload)?;
         received += len;
         match header[0] {
@@ -82,7 +108,23 @@ pub fn metadata(addr: SocketAddr, serial: &str) -> io::Result<DeviceMetadata> {
 }
 
 pub fn boot_completed(addr: SocketAddr, serial: &str) -> io::Result<bool> {
-    let output = shell_v2(addr, serial, "getprop sys.boot_completed")?;
+    check_boot_completed(shell_v2(addr, serial, "getprop sys.boot_completed")?)
+}
+
+pub fn boot_completed_with_timeout(
+    addr: SocketAddr,
+    serial: &str,
+    deadline: std::time::Instant,
+) -> io::Result<bool> {
+    check_boot_completed(shell_v2_with_timeout(
+        addr,
+        serial,
+        "getprop sys.boot_completed",
+        deadline,
+    )?)
+}
+
+fn check_boot_completed(output: ShellOutput) -> io::Result<bool> {
     if output.status != 0 {
         return Err(io::Error::other(format!(
             "boot check failed ({}): {}",
