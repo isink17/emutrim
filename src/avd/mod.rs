@@ -231,7 +231,7 @@ fn tune_file(path: &PathBuf, ram: u32) -> io::Result<()> {
     }
     fs::write(path, out)
 }
-pub fn start(name: &str, ram: u32, port: u16) -> io::Result<Child> {
+pub fn start(name: &str, ram: u32, port: u16, cold_boot: bool) -> io::Result<Child> {
     let info = inspect(name)?;
     validate_ram(&info, ram)?;
     if !info.image.is_dir() {
@@ -253,6 +253,9 @@ pub fn start(name: &str, ram: u32, port: u16) -> io::Result<Child> {
     let mut command = Command::new(emulator);
     command.args(["-avd", name, "-port", &port.to_string(), "-gpu", "host"]);
     command.arg("-memory").arg(ram.to_string());
+    if cold_boot {
+        command.arg("-no-snapshot");
+    }
     command.stdout(Stdio::null()).stderr(Stdio::null());
     if !info.is_16k {
         command.arg("-lowram");

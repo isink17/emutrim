@@ -214,7 +214,7 @@ fn tune(args: Vec<String>) -> io::Result<()> {
     Ok(())
 }
 fn start(args: Vec<String>) -> io::Result<()> {
-    let (name, requested_ram, no_slim, timings) = start_args(args)?;
+    let (name, requested_ram, no_slim, timings, cold_boot) = start_args(args)?;
     if no_slim && timings {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -241,7 +241,7 @@ fn start(args: Vec<String>) -> io::Result<()> {
     }
     let port = avd::available_console_port()?;
     let serial = format!("emulator-{port}");
-    let mut child = avd::start(&name, ram, port)?;
+    let mut child = avd::start(&name, ram, port, cold_boot)?;
     let mut timing = StartupTiming {
         capture: timings,
         launched: Some(Instant::now()),
@@ -406,16 +406,19 @@ fn slim_after_boot(addr: SocketAddr, serial: &str) -> io::Result<SlimResult> {
     }
 }
 
-fn start_args(args: Vec<String>) -> io::Result<(String, Option<u32>, bool, bool)> {
+fn start_args(args: Vec<String>) -> io::Result<(String, Option<u32>, bool, bool, bool)> {
     let mut name = None;
     let mut ram = None;
     let mut no_slim = false;
     let mut timings = false;
+    let mut cold_boot = false;
     for arg in args {
         if arg == "--no-slim" {
             no_slim = true;
         } else if arg == "--timings" {
             timings = true;
+        } else if arg == "--cold-boot" {
+            cold_boot = true;
         } else if let Some(value) = arg.strip_prefix("--ram=") {
             if ram.is_some() {
                 return Err(io::Error::new(
@@ -448,6 +451,7 @@ fn start_args(args: Vec<String>) -> io::Result<(String, Option<u32>, bool, bool)
         ram,
         no_slim,
         timings,
+        cold_boot,
     ))
 }
 
@@ -1510,15 +1514,19 @@ mod start_tests {
     fn start_defaults_ram_to_avd_config_and_accepts_no_slim() {
         assert_eq!(
             start_args(vec!["Test_AVD".into(), "--no-slim".into()]).unwrap(),
-            ("Test_AVD".into(), None, true, false)
+            ("Test_AVD".into(), None, true, false, false)
         );
         assert_eq!(
             start_args(vec!["Test_AVD".into(), "--ram=4096".into()]).unwrap(),
-            ("Test_AVD".into(), Some(4096), false, false)
+            ("Test_AVD".into(), Some(4096), false, false, false)
         );
         assert_eq!(
             start_args(vec!["Test_AVD".into(), "--timings".into()]).unwrap(),
-            ("Test_AVD".into(), None, false, true)
+            ("Test_AVD".into(), None, false, true, false)
+        );
+        assert_eq!(
+            start_args(vec!["Test_AVD".into(), "--cold-boot".into()]).unwrap(),
+            ("Test_AVD".into(), None, false, false, true)
         );
         assert!(start_args(vec!["Test_AVD".into(), "Other".into()]).is_err());
     }
