@@ -9,14 +9,14 @@ pub fn tcp_listener_image(_port: u16) -> io::Result<Option<(u32, PathBuf)>> {
 pub fn console_owner_pid(_port: u16) -> io::Result<Option<u32>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "native emulator process mapping is currently supported on Windows only",
+        "process-to-console identity verification is unsupported on this host",
     ))
 }
 
 pub fn belongs_to_launch(_owner_pid: u32, _launch_pid: u32) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "native emulator process mapping is currently supported on Windows only",
+        "process-to-console identity verification is unsupported on this host",
     ))
 }
 

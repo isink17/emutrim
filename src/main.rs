@@ -235,10 +235,10 @@ fn start(args: Vec<String>) -> io::Result<()> {
             ),
         ));
     }
-    if !no_slim && !cfg!(windows) {
+    if !no_slim && !platform::supports_verified_integrated_start() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "integrated start requires Windows process-to-console identity verification",
+            "integrated start requires verified process-to-console identity support",
         ));
     }
     let port = avd::available_console_port()?;
@@ -269,16 +269,17 @@ fn start(args: Vec<String>) -> io::Result<()> {
         },
         |deadline| {
             let running = child.try_wait().map(|status| status.is_none())?;
-            let console = timings
-                && remaining_until(deadline).is_ok()
+            let console = remaining_until(deadline).is_ok()
                 && avd::console::avd_name_until(port, deadline).is_ok_and(|actual| actual == name);
             Ok((running, console))
         },
         |remaining| thread::sleep(remaining.min(Duration::from_millis(500))),
         &mut timing,
     )?;
-    if timings && timing.console.is_none() {
-        eprintln!("startup timing: {}", timing.format());
+    if timing.console.is_none() {
+        if timings {
+            eprintln!("startup timing: {}", timing.format());
+        }
         return Err(console_timeout_error(&name));
     }
     if !ready {
@@ -537,9 +538,9 @@ fn doctor(args: Vec<String>) -> io::Result<()> {
         }
     };
     if let Some(sdk) = &sdk {
-        let emulator = sdk.join("emulator").join("emulator.exe");
+        let emulator = avd::emulator_path(sdk);
         if emulator.is_file() {
-            report_check("PASS", &format!("emulator.exe: {}", emulator.display()));
+            report_check("PASS", &format!("Emulator binary: {}", emulator.display()));
             match std::fs::read_to_string(sdk.join("emulator").join("package.xml")) {
                 Ok(metadata) if emulator_uses_preview_license(&metadata) => report_check(
                     "WARN",
@@ -572,7 +573,10 @@ fn doctor(args: Vec<String>) -> io::Result<()> {
                 _ => report_check("WARN", "emulator version query failed"),
             }
         } else {
-            report_check("FAIL", "emulator.exe missing");
+            report_check(
+                "FAIL",
+                &format!("Emulator binary missing: {}", emulator.display()),
+            );
             failures += 1;
         }
     }
@@ -990,7 +994,7 @@ fn wait_for_transport_with(
                 "emulator process exited before ADB transport became ready",
             ));
         }
-        if timing.capture && timing.console.is_none() && console_ready {
+        if timing.console.is_none() && console_ready {
             timing.console = Some(Instant::now());
         }
         if timing.state.as_deref() == Some("device") {
@@ -998,7 +1002,7 @@ fn wait_for_transport_with(
                 return Ok(false);
             }
             match owns_port()? {
-                Some(true) if !timing.capture || timing.console.is_some() => {
+                Some(true) if timing.console.is_some() => {
                     if remaining_until(deadline).is_err() {
                         return Ok(false);
                     }
@@ -1717,7 +1721,7 @@ mod start_tests {
             Instant::now() + Duration::from_secs(5),
             move |_| Ok(source.lock().unwrap().pop_front().unwrap_or_default()),
             move || Ok(owner_source.lock().unwrap().pop_front().unwrap_or(None)),
-            |_| Ok((true, false)),
+            |_| Ok((true, true)),
             |_| {},
             &mut timing,
         )
@@ -1748,6 +1752,22 @@ mod start_tests {
         assert!(timing.transport.is_some());
         assert!(timing.device.is_some());
         assert!(consoles.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn transport_wait_requires_console_match_without_timings() {
+        let mut timing = StartupTiming::default();
+        assert!(!wait_for_transport_with(
+            "emulator-5558",
+            Instant::now() + Duration::from_millis(2),
+            |_| Ok(vec![device("emulator-5558", "device")]),
+            || Ok(Some(true)),
+            |_| Ok((true, false)),
+            |_| {},
+            &mut timing,
+        )
+        .unwrap());
+        assert!(timing.console.is_none());
     }
 
     #[test]

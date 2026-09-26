@@ -22,37 +22,71 @@ pub struct AvdInfo {
 }
 
 pub fn sdk_dir() -> io::Result<PathBuf> {
-    for key in ["ANDROID_SDK_ROOT", "ANDROID_HOME"] {
-        if let Some(value) = env::var_os(key) {
+    sdk_dir_from(|key| env::var_os(key), |path| path.is_dir())
+}
+
+fn sdk_dir_from(
+    mut get_env: impl FnMut(&str) -> Option<std::ffi::OsString>,
+    is_dir: impl Fn(&std::path::Path) -> bool,
+) -> io::Result<PathBuf> {
+    for key in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Some(value) = get_env(key) {
             let path = PathBuf::from(value);
-            if path.is_dir() {
+            if is_dir(&path) {
                 return Ok(path);
             }
         }
     }
-    let local = env::var_os("LOCALAPPDATA").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "ANDROID_SDK_ROOT/ANDROID_HOME/LOCALAPPDATA unavailable",
-        )
-    })?;
-    let path = PathBuf::from(local).join("Android").join("Sdk");
-    if path.is_dir() {
+    let fallback = if cfg!(windows) {
+        get_env("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|path| path.join("Android").join("Sdk"))
+    } else {
+        get_env("HOME")
+            .map(PathBuf::from)
+            .map(|path| path.join("Library").join("Android").join("sdk"))
+    };
+    if let Some(path) = fallback.filter(|path| is_dir(path)) {
         Ok(path)
     } else {
+        let checked = if cfg!(windows) {
+            "%LOCALAPPDATA%\\Android\\Sdk"
+        } else {
+            "$HOME/Library/Android/sdk"
+        };
         Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "Android SDK not found; set ANDROID_SDK_ROOT",
+            format!("Android SDK not found; checked ANDROID_HOME, ANDROID_SDK_ROOT, and {checked}"),
         ))
     }
 }
 pub fn avd_base() -> io::Result<PathBuf> {
-    if let Some(path) = env::var_os("ANDROID_AVD_HOME") {
+    avd_base_from(|key| env::var_os(key))
+}
+
+fn avd_base_from(
+    mut get_env: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> io::Result<PathBuf> {
+    if let Some(path) = get_env("ANDROID_AVD_HOME") {
         return Ok(PathBuf::from(path));
     }
-    let home = env::var_os("USERPROFILE")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "USERPROFILE unavailable"))?;
-    Ok(PathBuf::from(home).join(".android").join("avd"))
+    if let Some(home) = get_env("ANDROID_USER_HOME") {
+        return Ok(PathBuf::from(home).join("avd"));
+    }
+    let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    get_env(home_key)
+        .map(PathBuf::from)
+        .map(|home| home.join(".android").join("avd"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{home_key} unavailable")))
+}
+
+pub fn emulator_path(sdk: &std::path::Path) -> PathBuf {
+    let name = if cfg!(windows) {
+        "emulator.exe"
+    } else {
+        "emulator"
+    };
+    sdk.join("emulator").join(name)
 }
 pub fn config_path(name: &str) -> io::Result<PathBuf> {
     let path = avd_base()?.join(format!("{name}.avd")).join("config.ini");
@@ -243,11 +277,11 @@ pub fn start(name: &str, ram: u32, port: u16, cold_boot: bool) -> io::Result<Chi
             ),
         ));
     }
-    let emulator = sdk_dir()?.join("emulator").join("emulator.exe");
+    let emulator = emulator_path(&sdk_dir()?);
     if !emulator.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "emulator.exe not found in Android SDK",
+            format!("Emulator binary not found: {}", emulator.display()),
         ));
     }
     let mut command = Command::new(emulator);
@@ -266,6 +300,70 @@ pub fn start(name: &str, ram: u32, port: u16, cold_boot: bool) -> io::Result<Chi
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn sdk_discovery_prefers_android_home_then_sdk_root() {
+        let env = |key: &str| match key {
+            "ANDROID_HOME" => Some("preferred".into()),
+            "ANDROID_SDK_ROOT" => Some("legacy".into()),
+            _ => None,
+        };
+        assert_eq!(
+            sdk_dir_from(env, |path| path == std::path::Path::new("preferred")).unwrap(),
+            PathBuf::from("preferred")
+        );
+        assert_eq!(
+            sdk_dir_from(env, |path| path == std::path::Path::new("legacy")).unwrap(),
+            PathBuf::from("legacy")
+        );
+    }
+
+    #[test]
+    fn sdk_discovery_uses_host_default() {
+        let expected = if cfg!(windows) {
+            PathBuf::from("local/Android/Sdk")
+        } else {
+            PathBuf::from("home/Library/Android/sdk")
+        };
+        let env = |key: &str| match key {
+            "HOME" => Some("home".into()),
+            "LOCALAPPDATA" => Some("local".into()),
+            _ => None,
+        };
+        let resolved = sdk_dir_from(env, |path| path == expected).unwrap();
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn avd_discovery_honors_overrides_and_host_home() {
+        assert_eq!(
+            avd_base_from(|key| (key == "ANDROID_AVD_HOME").then(|| "explicit".into())).unwrap(),
+            PathBuf::from("explicit")
+        );
+        assert_eq!(
+            avd_base_from(|key| (key == "ANDROID_USER_HOME").then(|| "user".into())).unwrap(),
+            PathBuf::from("user/avd")
+        );
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        assert_eq!(
+            avd_base_from(|key| (key == home_key).then(|| "home".into())).unwrap(),
+            PathBuf::from("home/.android/avd")
+        );
+        assert!(avd_base_from(|_| None).is_err());
+    }
+
+    #[test]
+    fn emulator_binary_name_matches_host() {
+        let name = if cfg!(windows) {
+            "emulator.exe"
+        } else {
+            "emulator"
+        };
+        assert_eq!(
+            emulator_path(std::path::Path::new("sdk")),
+            PathBuf::from("sdk/emulator").join(name)
+        );
+    }
     #[test]
     fn detects_16k() {
         assert!(is_16k(&parse(

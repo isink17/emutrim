@@ -1,13 +1,39 @@
 #[cfg(windows)]
 mod windows;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod unsupported;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub use macos::*;
+#[cfg(not(any(windows, target_os = "macos")))]
 pub use unsupported::*;
 #[cfg(windows)]
 pub use windows::*;
+
+pub const fn supports_verified_integrated_start() -> bool {
+    cfg!(any(
+        windows,
+        all(target_os = "macos", target_arch = "aarch64")
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn integrated_start_capability_matches_supported_hosts() {
+        assert_eq!(
+            super::supports_verified_integrated_start(),
+            cfg!(any(
+                windows,
+                all(target_os = "macos", target_arch = "aarch64")
+            ))
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessStats {

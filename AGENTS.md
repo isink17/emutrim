@@ -37,3 +37,4 @@ Safety order: physical target refusal; resolved emulator identity; boot complete
 - `emutrim-adb`: ADB protocol, tracking, transport, and shell execution changes.
 - `emutrim-safety`: guest mutation, profiles, state, and restore changes.
 - `emutrim-windows-avd`: Windows SDK/AVD discovery, config, launch, and 16 KB behavior.
+- `emutrim-macos-avd`: Apple Silicon SDK/AVD paths and fail-closed emulator launch identity.
