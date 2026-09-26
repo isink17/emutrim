@@ -12,7 +12,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 struct Config {
@@ -214,7 +214,13 @@ fn tune(args: Vec<String>) -> io::Result<()> {
     Ok(())
 }
 fn start(args: Vec<String>) -> io::Result<()> {
-    let (name, requested_ram, no_slim) = start_args(args)?;
+    let (name, requested_ram, no_slim, timings) = start_args(args)?;
+    if no_slim && timings {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--timings requires integrated start; remove --no-slim",
+        ));
+    }
     let info = avd::inspect(&name)?;
     let ram = requested_ram.unwrap_or(info.ram_mb);
     avd::validate_ram(&info, ram)?;
@@ -236,6 +242,11 @@ fn start(args: Vec<String>) -> io::Result<()> {
     let port = avd::available_console_port()?;
     let serial = format!("emulator-{port}");
     let mut child = avd::start(&name, ram, port)?;
+    let mut timing = StartupTiming {
+        capture: timings,
+        launched: Some(Instant::now()),
+        ..StartupTiming::default()
+    };
     let launch_pid = child.id();
     println!("started {name} as {serial}");
     if no_slim {
@@ -243,7 +254,6 @@ fn start(args: Vec<String>) -> io::Result<()> {
     }
 
     println!("waiting for ADB transport...");
-    let mut observation = TransportObservation::default();
     let ready = wait_for_transport_with(
         &serial,
         240,
@@ -252,16 +262,24 @@ fn start(args: Vec<String>) -> io::Result<()> {
             Some(owner) => Ok(Some(platform::belongs_to_launch(owner, launch_pid)?)),
             None => Ok(None),
         },
-        || child.try_wait().map(|status| status.is_none()),
+        || {
+            let running = child.try_wait().map(|status| status.is_none())?;
+            let console =
+                timings && avd::console::avd_name(port).is_ok_and(|actual| actual == name);
+            Ok((running, console))
+        },
         || thread::sleep(Duration::from_millis(500)),
-        &mut observation,
+        &mut timing,
     )?;
+    if timings && timing.console.is_none() {
+        return Err(console_timeout_error(&name));
+    }
     if !ready {
         return Err(transport_timeout_error(
             &serial,
             child.try_wait()?.is_none(),
-            observation.state.as_deref(),
-            observation.error.as_deref(),
+            timing.state.as_deref(),
+            timing.error.as_deref(),
         ));
     }
     let qemu = shell_v2(default_adb_addr(), &serial, "getprop ro.kernel.qemu")?;
@@ -277,7 +295,13 @@ fn start(args: Vec<String>) -> io::Result<()> {
     let boot_result = wait_for_boot_checked(
         &serial,
         240,
-        || boot_completed(default_adb_addr(), &serial),
+        || {
+            let result = boot_completed(default_adb_addr(), &serial);
+            if matches!(&result, Ok(true)) {
+                timing.boot = Some(Instant::now());
+            }
+            result
+        },
         || child.try_wait().map(|status| status.is_none()),
         || thread::sleep(Duration::from_millis(500)),
         || {
@@ -309,7 +333,64 @@ fn start(args: Vec<String>) -> io::Result<()> {
             ));
         }
     }
-    action.unwrap_or_else(|| Err(io::Error::other("boot completed without start action")))
+    let result =
+        action.unwrap_or_else(|| Err(io::Error::other("boot completed without start action")));
+    if result.is_ok() && timings {
+        timing.ready = Some(Instant::now());
+        println!("startup timing: {}", timing.format());
+    }
+    result
+}
+
+fn console_timeout_error(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("timed out waiting for authenticated console for {name} (launch→console phase)"),
+    )
+}
+
+#[derive(Default)]
+struct StartupTiming {
+    capture: bool,
+    launched: Option<Instant>,
+    console: Option<Instant>,
+    transport: Option<Instant>,
+    device: Option<Instant>,
+    boot: Option<Instant>,
+    ready: Option<Instant>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+impl StartupTiming {
+    fn elapsed(&self, start: Option<Instant>, end: Option<Instant>) -> String {
+        match (start, end) {
+            (Some(start), Some(end)) => {
+                if end >= start {
+                    format!("{:.1}s", end.duration_since(start).as_secs_f64())
+                } else {
+                    format!("-{:.1}s", start.duration_since(end).as_secs_f64())
+                }
+            }
+            _ => "n/a".into(),
+        }
+    }
+
+    fn format(&self) -> String {
+        let launched = self.launched;
+        format!(
+            "launch→console {}; console→ADB {}; ADB→device {}; device→boot {}; boot→ready {}; total {}",
+            self.elapsed(launched, self.console),
+            self.elapsed(self.console, self.transport),
+            self.elapsed(self.transport, self.device),
+            self.elapsed(self.device, self.boot),
+            self.elapsed(self.boot, self.ready),
+            match (launched, self.ready) {
+                (Some(start), Some(end)) => format!("{:.1}s", end.duration_since(start).as_secs_f64()),
+                _ => "n/a".into(),
+            }
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,13 +406,16 @@ fn slim_after_boot(addr: SocketAddr, serial: &str) -> io::Result<SlimResult> {
     }
 }
 
-fn start_args(args: Vec<String>) -> io::Result<(String, Option<u32>, bool)> {
+fn start_args(args: Vec<String>) -> io::Result<(String, Option<u32>, bool, bool)> {
     let mut name = None;
     let mut ram = None;
     let mut no_slim = false;
+    let mut timings = false;
     for arg in args {
         if arg == "--no-slim" {
             no_slim = true;
+        } else if arg == "--timings" {
+            timings = true;
         } else if let Some(value) = arg.strip_prefix("--ram=") {
             if ram.is_some() {
                 return Err(io::Error::new(
@@ -363,6 +447,7 @@ fn start_args(args: Vec<String>) -> io::Result<(String, Option<u32>, bool)> {
         name.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pass an AVD name"))?,
         ram,
         no_slim,
+        timings,
     ))
 }
 
@@ -825,52 +910,57 @@ fn stats_args(args: Vec<String>) -> io::Result<(String, u64)> {
     ))
 }
 
-#[derive(Default)]
-struct TransportObservation {
-    state: Option<String>,
-    error: Option<String>,
-}
-
 fn wait_for_transport_with(
     serial: &str,
     attempts: usize,
     mut snapshot: impl FnMut() -> io::Result<Vec<DeviceState>>,
     mut owns_port: impl FnMut() -> io::Result<Option<bool>>,
-    mut process_running: impl FnMut() -> io::Result<bool>,
+    mut process_and_console: impl FnMut() -> io::Result<(bool, bool)>,
     mut pause: impl FnMut(),
-    observation: &mut TransportObservation,
+    timing: &mut StartupTiming,
 ) -> io::Result<bool> {
     for _ in 0..attempts {
-        if !process_running()? {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "emulator process exited before ADB transport became ready",
-            ));
-        }
         match snapshot() {
             Ok(devices) => {
-                observation.error = None;
+                timing.error = None;
                 if let Some(state) = devices
                     .iter()
                     .find(|device| device.serial == serial)
                     .map(|device| device.state.clone())
                 {
-                    observation.state = Some(state);
-                }
-                if observation.state.as_deref() == Some("device") {
-                    match owns_port()? {
-                        Some(true) => return Ok(true),
-                        Some(false) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                format!("ADB serial {serial} is not owned by launched emulator"),
-                            ));
+                    timing.state = Some(state);
+                    if timing.capture {
+                        timing.transport.get_or_insert_with(Instant::now);
+                        if timing.state.as_deref() == Some("device") {
+                            timing.device.get_or_insert_with(Instant::now);
                         }
-                        None => {}
                     }
                 }
             }
-            Err(error) => observation.error = Some(error.to_string()),
+            Err(error) => timing.error = Some(error.to_string()),
+        }
+        let (process_running, console_ready) = process_and_console()?;
+        if !process_running {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "emulator process exited before ADB transport became ready",
+            ));
+        }
+        if timing.capture && timing.console.is_none() && console_ready {
+            timing.console = Some(Instant::now());
+        }
+        if timing.state.as_deref() == Some("device") {
+            match owns_port()? {
+                Some(true) if !timing.capture || timing.console.is_some() => return Ok(true),
+                Some(true) => {}
+                Some(false) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("ADB serial {serial} is not owned by launched emulator"),
+                    ));
+                }
+                None => {}
+            }
         }
         pause();
     }
@@ -1105,7 +1195,7 @@ fn watch_target_matches(target: Option<&str>, serial: &str) -> bool {
     target.is_none_or(|target| target == serial)
 }
 fn print_help() {
-    println!("emutrim\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL]\n  emutrim start <AVD> [--ram=N] [--no-slim]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--ram=N]\n  emutrim list-avds\n\nstart launches, waits for Android boot, then slims. --no-slim launches only.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.");
+    println!("emutrim\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL]\n  emutrim start <AVD> [--ram=N] [--no-slim] [--timings]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--ram=N]\n  emutrim list-avds\n\nstart launches, waits for Android boot, then slims. --no-slim launches only; --timings reports successful integrated-start phases.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.");
 }
 
 #[cfg(test)]
@@ -1420,13 +1510,41 @@ mod start_tests {
     fn start_defaults_ram_to_avd_config_and_accepts_no_slim() {
         assert_eq!(
             start_args(vec!["Test_AVD".into(), "--no-slim".into()]).unwrap(),
-            ("Test_AVD".into(), None, true)
+            ("Test_AVD".into(), None, true, false)
         );
         assert_eq!(
             start_args(vec!["Test_AVD".into(), "--ram=4096".into()]).unwrap(),
-            ("Test_AVD".into(), Some(4096), false)
+            ("Test_AVD".into(), Some(4096), false, false)
+        );
+        assert_eq!(
+            start_args(vec!["Test_AVD".into(), "--timings".into()]).unwrap(),
+            ("Test_AVD".into(), None, false, true)
         );
         assert!(start_args(vec!["Test_AVD".into(), "Other".into()]).is_err());
+    }
+
+    #[test]
+    fn startup_timing_formats_deterministic_phases() {
+        let base = Instant::now();
+        let timing = StartupTiming {
+            launched: Some(base),
+            console: Some(base + Duration::from_secs(2)),
+            transport: Some(base + Duration::from_secs(8)),
+            device: Some(base + Duration::from_secs(10)),
+            boot: Some(base + Duration::from_secs(20)),
+            ready: Some(base + Duration::from_secs(25)),
+            ..StartupTiming::default()
+        };
+        assert_eq!(
+            timing.format(),
+            "launch→console 2.0s; console→ADB 6.0s; ADB→device 2.0s; device→boot 10.0s; boot→ready 5.0s; total 25.0s"
+        );
+        let timing = StartupTiming {
+            transport: Some(base + Duration::from_secs(1)),
+            console: Some(base + Duration::from_secs(2)),
+            ..timing
+        };
+        assert!(timing.format().contains("console→ADB -1.0s"));
     }
 
     #[test]
@@ -1451,32 +1569,63 @@ mod start_tests {
         let source = snapshots.clone();
         let owners = Arc::new(Mutex::new(VecDeque::from([None, Some(true)])));
         let owner_source = owners.clone();
-        let mut observation = TransportObservation::default();
+        let mut timing = StartupTiming::default();
         assert!(wait_for_transport_with(
             "emulator-5558",
             3,
             move || Ok(source.lock().unwrap().pop_front().unwrap_or_default()),
             move || Ok(owner_source.lock().unwrap().pop_front().unwrap_or(None)),
-            || Ok(true),
+            || Ok((true, false)),
             || {},
-            &mut observation,
+            &mut timing,
         )
         .unwrap());
-        assert_eq!(observation.state.as_deref(), Some("device"));
+        assert_eq!(timing.state.as_deref(), Some("device"));
         assert_eq!(owners.lock().unwrap().len(), 0);
     }
 
     #[test]
+    fn timed_transport_wait_observes_console_concurrently() {
+        let consoles = Arc::new(Mutex::new(VecDeque::from([false, false, true])));
+        let probe = consoles.clone();
+        let mut timing = StartupTiming {
+            capture: true,
+            ..StartupTiming::default()
+        };
+        assert!(wait_for_transport_with(
+            "emulator-5558",
+            3,
+            || Ok(vec![device("emulator-5558", "device")]),
+            || Ok(Some(true)),
+            move || Ok((true, probe.lock().unwrap().pop_front().unwrap())),
+            || {},
+            &mut timing,
+        )
+        .unwrap());
+        assert!(timing.console.is_some());
+        assert!(timing.transport.is_some());
+        assert!(timing.device.is_some());
+        assert!(consoles.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn console_timeout_identifies_startup_phase() {
+        let error = console_timeout_error("Fresh_API37");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("launch→console phase"));
+    }
+
+    #[test]
     fn transport_timeout_and_owner_collision_fail_closed() {
-        let mut observation = TransportObservation::default();
+        let mut timing = StartupTiming::default();
         assert!(!wait_for_transport_with(
             "emulator-5558",
             2,
             || Ok(Vec::new()),
             || Ok(None),
-            || Ok(true),
+            || Ok((true, false)),
             || {},
-            &mut observation,
+            &mut timing,
         )
         .unwrap());
         assert!(wait_for_transport_with(
@@ -1484,9 +1633,9 @@ mod start_tests {
             1,
             || Ok(vec![device("emulator-5558", "device")]),
             || Ok(Some(false)),
-            || Ok(true),
+            || Ok((true, false)),
             || {},
-            &mut observation,
+            &mut timing,
         )
         .is_err());
         assert!(wait_for_transport_with(
@@ -1494,9 +1643,9 @@ mod start_tests {
             1,
             || Ok(Vec::new()),
             || Ok(None),
-            || Ok(false),
+            || Ok((false, false)),
             || {},
-            &mut observation,
+            &mut timing,
         )
         .is_err());
     }
