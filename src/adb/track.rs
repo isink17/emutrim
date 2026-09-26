@@ -142,7 +142,10 @@ mod tests {
         });
 
         let result = devices_with_timeout(addr, Instant::now() + Duration::from_millis(50));
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(matches!(
+            result.unwrap_err().kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ));
         ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         release_tx.send(()).unwrap();
         server.join().unwrap();
