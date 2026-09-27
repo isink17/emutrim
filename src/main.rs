@@ -421,7 +421,7 @@ impl StartupTiming {
                 if end >= start {
                     format!("{:.1}s", end.duration_since(start).as_secs_f64())
                 } else {
-                    format!("-{:.1}s", start.duration_since(end).as_secs_f64())
+                    "overlap".into()
                 }
             }
             _ => "n/a".into(),
@@ -1327,7 +1327,12 @@ fn print_help() {
     } else {
         "~/.emutrim"
     };
-    println!("emutrim {}\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL] [--managed]\n  emutrim start <AVD> [--managed] [--ram=N] [--no-slim] [--timings] [--cold-boot]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--managed] [--ram=N]\n  emutrim list-avds [--managed]\n  emutrim managed root|status|setup|clean [--yes]\n  emutrim --version, -V\n\nDefault EmuTrim managed root: {managed_root}; override: EMUTRIM_HOME.\nstart launches and waits for Android boot, then slims unless --no-slim is set. --timings reports startup phases; --cold-boot bypasses Quick Boot for that launch.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.", env!("CARGO_PKG_VERSION"));
+    let stats_note = if cfg!(target_os = "macos") {
+        "stats is not supported on macOS."
+    } else {
+        "stats reports Windows process metrics."
+    };
+    println!("emutrim {}\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL] [--managed]\n  emutrim start <AVD> [--managed] [--ram=N] [--no-slim] [--timings] [--cold-boot]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--managed] [--ram=N]\n  emutrim list-avds [--managed]\n  emutrim managed root|status|setup|clean [--yes]\n  emutrim --version, -V\n\nDefault EmuTrim managed root: {managed_root}; override: EMUTRIM_HOME.\nstart launches and waits for Android boot, then slims unless --no-slim is set. --timings reports startup phases; --cold-boot bypasses Quick Boot for that launch.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.\n{stats_note}", env!("CARGO_PKG_VERSION"));
 }
 
 #[cfg(test)]
@@ -1715,7 +1720,17 @@ mod start_tests {
             console: Some(base + Duration::from_secs(2)),
             ..timing
         };
-        assert!(timing.format().contains("console→ADB -1.0s"));
+        assert!(timing.format().contains("console→ADB overlap"));
+        assert!(timing.format().contains("total 25.0s"));
+        let timing = StartupTiming {
+            launched: Some(base),
+            console: Some(base),
+            transport: Some(base),
+            ..StartupTiming::default()
+        };
+        assert!(timing
+            .format()
+            .contains("launch→console 0.0s; console→ADB 0.0s"));
     }
 
     #[test]
