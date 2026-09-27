@@ -1,8 +1,8 @@
 [package]
 name = "emutrim"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Windows-first Android Emulator startup, optimization, and diagnostics"
+description = "Rust tooling for Android Emulator startup, optimization, and diagnostics on Windows and Apple Silicon macOS"
 license = "MIT"
 
 [dependencies]
