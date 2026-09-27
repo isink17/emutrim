@@ -185,6 +185,18 @@ fn clean(layout: &Layout, yes: bool) -> io::Result<()> {
     Ok(())
 }
 
+fn emulator_pids(processes: &str, emulator_dir: &Path) -> Vec<String> {
+    let root = emulator_dir.to_string_lossy();
+    processes
+        .lines()
+        .filter_map(|line| {
+            let pid = line.split_whitespace().next()?;
+            (pid.bytes().all(|byte| byte.is_ascii_digit()) && line.contains(root.as_ref()))
+                .then(|| pid.to_owned())
+        })
+        .collect()
+}
+
 #[cfg(windows)]
 fn running_managed_emulators(layout: &Layout) -> io::Result<Vec<String>> {
     let output = Command::new("powershell")
@@ -206,36 +218,19 @@ fn running_managed_emulators(layout: &Layout) -> io::Result<Vec<String>> {
         .collect())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn running_managed_emulators(layout: &Layout) -> io::Result<Vec<String>> {
-    let executable = layout.sdk.join("emulator/emulator");
-    if !executable.is_file() {
-        return Ok(Vec::new());
-    }
-    let output = Command::new("/usr/sbin/lsof")
-        .args([
-            "-t",
-            executable.to_str().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "invalid managed Emulator path")
-            })?,
-        ])
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
         .output()?;
-    if !output.status.success() && (!output.stdout.is_empty() || !output.stderr.is_empty()) {
+    if !output.status.success() {
         return Err(io::Error::other(
             "failed to inspect running managed Emulator processes",
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::to_owned)
-        .collect())
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn running_managed_emulators(_layout: &Layout) -> io::Result<Vec<String>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cannot verify managed Emulator processes on this host",
+    Ok(emulator_pids(
+        &String::from_utf8_lossy(&output.stdout),
+        &layout.sdk.join("emulator"),
     ))
 }
 
@@ -277,6 +272,7 @@ fn setup(layout: &Layout) -> io::Result<()> {
         .env("ANDROID_AVD_HOME", &layout.avd)
         .env("ANDROID_USER_HOME", layout.tmp.join("android-user"))
         .env("ANDROID_EMULATOR_HOME", layout.tmp.join("emulator-home"))
+        .env("TMPDIR", &layout.tmp)
         .output()?;
     if !listing.status.success() {
         return Err(io::Error::other(format!(
@@ -318,6 +314,7 @@ fn setup(layout: &Layout) -> io::Result<()> {
             .env("ANDROID_AVD_HOME", &layout.avd)
             .env("ANDROID_USER_HOME", layout.tmp.join("android-user"))
             .env("ANDROID_EMULATOR_HOME", layout.tmp.join("emulator-home"))
+            .env("TMPDIR", &layout.tmp)
             .status()?;
         if !result.success() {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("sdkmanager failed for {package}; accept required licenses explicitly with `{} --sdk_root={} --licenses`", bootstrap.display(), layout.sdk.display())));
@@ -387,6 +384,7 @@ fn setup(layout: &Layout) -> io::Result<()> {
             .env("ANDROID_AVD_HOME", &layout.avd)
             .env("ANDROID_USER_HOME", layout.tmp.join("android-user"))
             .env("ANDROID_EMULATOR_HOME", layout.tmp.join("emulator-home"))
+            .env("TMPDIR", &layout.tmp)
             .output()?;
         if !output.status.success() {
             return Err(io::Error::other(format!(
@@ -477,5 +475,17 @@ mod tests {
             fs::remove_dir_all(outside).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_scan_finds_qemu_under_managed_emulator_package() {
+        let processes = "14454 1 /Users/test/.emutrim/managed/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64 -avd Test\n14500 1 /Applications/Android Studio.app/emulator/qemu-system-aarch64\n";
+        assert_eq!(
+            emulator_pids(
+                processes,
+                Path::new("/Users/test/.emutrim/managed/sdk/emulator")
+            ),
+            ["14454"]
+        );
     }
 }

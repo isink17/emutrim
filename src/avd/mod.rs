@@ -380,7 +380,8 @@ pub fn start_mode(
             .env("ANDROID_SDK_ROOT", &sdk)
             .env("ANDROID_AVD_HOME", &layout.avd)
             .env("ANDROID_USER_HOME", layout.tmp.join("android-user"))
-            .env("ANDROID_EMULATOR_HOME", layout.tmp.join("emulator-home"));
+            .env("ANDROID_EMULATOR_HOME", layout.tmp.join("emulator-home"))
+            .env("TMPDIR", &layout.tmp);
     }
     command.arg("-memory").arg(ram.to_string());
     if cold_boot {
