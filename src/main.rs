@@ -1327,10 +1327,12 @@ fn print_help() {
     } else {
         "~/.emutrim"
     };
-    let stats_note = if cfg!(target_os = "macos") {
+    let stats_note = if cfg!(windows) {
+        "stats reports Windows process metrics."
+    } else if cfg!(target_os = "macos") {
         "stats is not supported on macOS."
     } else {
-        "stats reports Windows process metrics."
+        "stats is not available on this platform."
     };
     println!("emutrim {}\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL] [--managed]\n  emutrim start <AVD> [--managed] [--ram=N] [--no-slim] [--timings] [--cold-boot]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--managed] [--ram=N]\n  emutrim list-avds [--managed]\n  emutrim managed root|status|setup|clean [--yes]\n  emutrim --version, -V\n\nDefault EmuTrim managed root: {managed_root}; override: EMUTRIM_HOME.\nstart launches and waits for Android boot, then slims unless --no-slim is set. --timings reports startup phases; --cold-boot bypasses Quick Boot for that launch.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.\n{stats_note}", env!("CARGO_PKG_VERSION"));
 }
