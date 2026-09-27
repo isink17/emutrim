@@ -207,15 +207,16 @@ fn running_managed_emulators(layout: &Layout) -> io::Result<Vec<String>> {
             "failed to inspect running Windows processes",
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
+    let processes: String = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
             let (pid, path) = line.split_once('|')?;
             Path::new(path)
                 .starts_with(layout.sdk.join("emulator"))
-                .then(|| pid.to_owned())
+                .then(|| format!("{pid} {path}\n"))
         })
-        .collect())
+        .collect();
+    Ok(emulator_pids(&processes, &layout.sdk.join("emulator")))
 }
 
 #[cfg(unix)]
