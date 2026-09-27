@@ -20,6 +20,7 @@ impl Tracker {
     pub fn connect(addr: SocketAddr) -> io::Result<Self> {
         let mut stream = connect(addr)?;
         send_service(&mut stream, "host:track-devices")?;
+        stream.set_read_timeout(None)?;
         Ok(Self { stream })
     }
 
@@ -109,6 +110,7 @@ mod tests {
     fn tracker_uses_loopback_smart_socket_service() {
         let server = FakeAdb::start(|_| Vec::new());
         let mut tracker = Tracker::connect(server.addr()).unwrap();
+        assert_eq!(tracker.stream.read_timeout().unwrap(), None);
         assert!(tracker.next_snapshot().unwrap().is_empty());
     }
 
