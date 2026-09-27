@@ -24,6 +24,13 @@ pub struct AvdInfo {
 pub fn sdk_dir() -> io::Result<PathBuf> {
     sdk_dir_from(|key| env::var_os(key), |path| path.is_dir())
 }
+pub fn sdk_dir_mode(managed: bool) -> io::Result<PathBuf> {
+    if managed {
+        Ok(crate::managed::Layout::resolve()?.sdk)
+    } else {
+        sdk_dir()
+    }
+}
 
 fn sdk_dir_from(
     mut get_env: impl FnMut(&str) -> Option<std::ffi::OsString>,
@@ -63,6 +70,13 @@ fn sdk_dir_from(
 pub fn avd_base() -> io::Result<PathBuf> {
     avd_base_from(|key| env::var_os(key))
 }
+fn avd_base_mode(managed: bool) -> io::Result<PathBuf> {
+    if managed {
+        Ok(crate::managed::Layout::resolve()?.avd)
+    } else {
+        avd_base()
+    }
+}
 
 fn avd_base_from(
     mut get_env: impl FnMut(&str) -> Option<std::ffi::OsString>,
@@ -88,9 +102,43 @@ pub fn emulator_path(sdk: &std::path::Path) -> PathBuf {
     };
     sdk.join("emulator").join(name)
 }
-pub fn config_path(name: &str) -> io::Result<PathBuf> {
-    let path = avd_base()?.join(format!("{name}.avd")).join("config.ini");
+pub(crate) fn config_path_mode(name: &str, managed: bool) -> io::Result<PathBuf> {
+    if managed
+        && !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid managed AVD name",
+        ));
+    }
+    let base = avd_base_mode(managed)?;
+    let avd_dir = base.join(format!("{name}.avd"));
+    if managed {
+        let ini = base.join(format!("{name}.ini"));
+        let ini_text = fs::read_to_string(&ini)?;
+        let recorded = ini_text
+            .lines()
+            .find_map(|line| line.strip_prefix("path="))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "managed AVD .ini has no path")
+            })?;
+        if PathBuf::from(recorded).canonicalize()? != avd_dir.canonicalize()? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "managed AVD .ini path escapes managed AVD home",
+            ));
+        }
+    }
+    let path = avd_dir.join("config.ini");
     if path.is_file() {
+        if managed && !path.canonicalize()?.starts_with(base.canonicalize()?) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "managed AVD config escapes managed AVD home",
+            ));
+        }
         Ok(path)
     } else {
         Err(io::Error::new(
@@ -99,9 +147,9 @@ pub fn config_path(name: &str) -> io::Result<PathBuf> {
         ))
     }
 }
-pub fn list() -> io::Result<Vec<String>> {
+pub fn list_mode(managed: bool) -> io::Result<Vec<String>> {
     let mut names = Vec::new();
-    for entry in fs::read_dir(avd_base()?)? {
+    for entry in fs::read_dir(avd_base_mode(managed)?)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             if let Some(name) = entry
@@ -109,7 +157,11 @@ pub fn list() -> io::Result<Vec<String>> {
                 .to_str()
                 .and_then(|s| s.strip_suffix(".avd"))
             {
-                if entry.path().join("config.ini").is_file() {
+                if if managed {
+                    config_path_mode(name, true).is_ok()
+                } else {
+                    entry.path().join("config.ini").is_file()
+                } {
                     names.push(name.to_owned());
                 }
             }
@@ -135,8 +187,8 @@ pub fn is_16k(config: &BTreeMap<String, String>) -> bool {
             v.contains("ps16k") || v.contains("16kb") || v.contains("page_size_16kb")
         })
 }
-pub fn inspect(name: &str) -> io::Result<AvdInfo> {
-    let path = config_path(name)?;
+pub fn inspect_mode(name: &str, managed: bool) -> io::Result<AvdInfo> {
+    let path = config_path_mode(name, managed)?;
     let config = parse(&fs::read_to_string(&path)?);
     let image_relative = config.get("image.sysdir.1").ok_or_else(|| {
         io::Error::new(
@@ -144,10 +196,22 @@ pub fn inspect(name: &str) -> io::Result<AvdInfo> {
             "AVD config has no system image path",
         )
     })?;
-    let image = sdk_dir()?.join(image_relative);
+    let image_relative_path = std::path::Path::new(image_relative);
+    if managed
+        && (image_relative_path.is_absolute()
+            || image_relative_path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed AVD system image path escapes managed SDK",
+        ));
+    }
+    let image = sdk_dir_mode(managed)?.join(image_relative);
     let ram_mb = config
         .get("hw.ramSize")
-        .and_then(|value| value.parse().ok())
+        .and_then(|value| parse_ram_mb(value))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "AVD RAM is invalid"))?;
     Ok(AvdInfo {
         api: config
@@ -176,6 +240,19 @@ pub fn inspect(name: &str) -> io::Result<AvdInfo> {
             .unwrap_or_else(|| "unset".into()),
         backup_exists: path.with_extension("ini.emutrim.bak").is_file(),
     })
+}
+
+fn parse_ram_mb(value: &str) -> Option<u32> {
+    if let Ok(mb) = value.parse() {
+        return Some(mb);
+    }
+    let (amount, unit) = value.split_at(value.len().checked_sub(1)?);
+    let amount = amount.parse::<u32>().ok()?;
+    match unit.to_ascii_uppercase().as_str() {
+        "G" => amount.checked_mul(1024),
+        "M" => Some(amount),
+        _ => None,
+    }
 }
 
 pub fn validate_ram(info: &AvdInfo, ram_mb: u32) -> io::Result<()> {
@@ -223,8 +300,8 @@ pub fn console_port(serial: &str) -> Option<u16> {
     let port = serial.strip_prefix("emulator-")?.parse::<u16>().ok()?;
     ((5554..=5682).contains(&port) && port % 2 == 0).then_some(port)
 }
-pub fn tune(name: &str, ram: u32) -> io::Result<()> {
-    tune_file(&config_path(name)?, ram)
+pub fn tune_mode(name: &str, ram: u32, managed: bool) -> io::Result<()> {
+    tune_file(&config_path_mode(name, managed)?, ram)
 }
 fn tune_file(path: &PathBuf, ram: u32) -> io::Result<()> {
     let text = fs::read_to_string(path)?;
@@ -265,8 +342,14 @@ fn tune_file(path: &PathBuf, ram: u32) -> io::Result<()> {
     }
     fs::write(path, out)
 }
-pub fn start(name: &str, ram: u32, port: u16, cold_boot: bool) -> io::Result<Child> {
-    let info = inspect(name)?;
+pub fn start_mode(
+    name: &str,
+    ram: u32,
+    port: u16,
+    cold_boot: bool,
+    managed: bool,
+) -> io::Result<Child> {
+    let info = inspect_mode(name, managed)?;
     validate_ram(&info, ram)?;
     if !info.image.is_dir() {
         return Err(io::Error::new(
@@ -277,7 +360,8 @@ pub fn start(name: &str, ram: u32, port: u16, cold_boot: bool) -> io::Result<Chi
             ),
         ));
     }
-    let emulator = emulator_path(&sdk_dir()?);
+    let sdk = sdk_dir_mode(managed)?;
+    let emulator = emulator_path(&sdk);
     if !emulator.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -286,6 +370,18 @@ pub fn start(name: &str, ram: u32, port: u16, cold_boot: bool) -> io::Result<Chi
     }
     let mut command = Command::new(emulator);
     command.args(["-avd", name, "-port", &port.to_string(), "-gpu", "host"]);
+    if managed {
+        let layout = crate::managed::Layout::resolve()?;
+        command
+            .arg("-datadir")
+            .arg(layout.avd.join(format!("{name}.avd")));
+        command
+            .env("ANDROID_HOME", &sdk)
+            .env("ANDROID_SDK_ROOT", &sdk)
+            .env("ANDROID_AVD_HOME", &layout.avd)
+            .env("ANDROID_USER_HOME", layout.tmp.join("android-user"))
+            .env("ANDROID_EMULATOR_HOME", layout.tmp.join("emulator-home"));
+    }
     command.arg("-memory").arg(ram.to_string());
     if cold_boot {
         command.arg("-no-snapshot");
@@ -408,6 +504,15 @@ mod tests {
     #[test]
     fn parser_ignores_malformed() {
         assert!(parse("broken\na=b\n").contains_key("a"));
+    }
+
+    #[test]
+    fn parses_android_ram_units_as_megabytes() {
+        assert_eq!(parse_ram_mb("2048"), Some(2048));
+        assert_eq!(parse_ram_mb("2G"), Some(2048));
+        assert_eq!(parse_ram_mb("512M"), Some(512));
+        assert_eq!(parse_ram_mb("4294967295G"), None);
+        assert_eq!(parse_ram_mb("invalid"), None);
     }
     #[test]
     fn tune_preserves_unrelated_config_and_backup() {

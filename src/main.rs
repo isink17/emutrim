@@ -1,5 +1,6 @@
 mod adb;
 mod avd;
+mod managed;
 mod platform;
 mod slim;
 
@@ -71,11 +72,19 @@ fn run() -> io::Result<()> {
             Ok(())
         }
         "tune-avd" => tune(args),
+        "managed" => managed::run(args),
         "start" => start(args),
         "doctor" => doctor(args),
         "stats" => stats(args),
         "list-avds" => {
-            for name in avd::list()? {
+            let managed = args.iter().any(|arg| arg == "--managed");
+            if args.iter().any(|arg| arg != "--managed") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "usage: list-avds [--managed]",
+                ));
+            }
+            for name in avd::list_mode(managed)? {
                 println!("{name}");
             }
             Ok(())
@@ -176,7 +185,12 @@ fn resolve(config: &mut Config) -> io::Result<String> {
         )),
     }
 }
-fn avd_args(args: Vec<String>, verb: &str, require_name: bool) -> io::Result<(String, u32)> {
+fn avd_args(
+    args: Vec<String>,
+    verb: &str,
+    require_name: bool,
+    managed: bool,
+) -> io::Result<(String, u32)> {
     let mut name = None;
     let mut ram = 1536;
     for arg in args {
@@ -198,7 +212,7 @@ fn avd_args(args: Vec<String>, verb: &str, require_name: bool) -> io::Result<(St
             if require_name {
                 None
             } else {
-                avd::list().ok().and_then(|v| {
+                avd::list_mode(managed).ok().and_then(|v| {
                     if v.len() == 1 {
                         Some(v[0].clone())
                     } else {
@@ -216,14 +230,18 @@ fn avd_args(args: Vec<String>, verb: &str, require_name: bool) -> io::Result<(St
     Ok((name, ram))
 }
 fn tune(args: Vec<String>) -> io::Result<()> {
-    let (name, ram) = avd_args(args, "tune-avd", false)?;
-    avd::tune(&name, ram)?;
+    let managed = args.iter().any(|arg| arg == "--managed");
+    let args: Vec<String> = args.into_iter().filter(|arg| arg != "--managed").collect();
+    let (name, ram) = avd_args(args, "tune-avd", false, managed)?;
+    avd::tune_mode(&name, ram, managed)?;
     println!("tuned {name}; backup config.ini.emutrim.bak preserved");
     Ok(())
 }
 fn start(args: Vec<String>) -> io::Result<()> {
+    let managed = args.iter().any(|arg| arg == "--managed");
+    let args: Vec<String> = args.into_iter().filter(|arg| arg != "--managed").collect();
     let (name, requested_ram, no_slim, timings, cold_boot) = start_args(args)?;
-    let info = avd::inspect(&name)?;
+    let info = avd::inspect_mode(&name, managed)?;
     let ram = requested_ram.unwrap_or(info.ram_mb);
     avd::validate_ram(&info, ram)?;
     if !info.image.is_dir() {
@@ -243,7 +261,7 @@ fn start(args: Vec<String>) -> io::Result<()> {
     }
     let port = avd::available_console_port()?;
     let serial = format!("emulator-{port}");
-    let mut child = avd::start(&name, ram, port, cold_boot)?;
+    let mut child = avd::start_mode(&name, ram, port, cold_boot, managed)?;
     let mut timing = StartupTiming {
         capture: timings,
         launched: Some(Instant::now()),
@@ -499,6 +517,8 @@ fn default_adb_addr() -> SocketAddr {
 }
 
 fn doctor(args: Vec<String>) -> io::Result<()> {
+    let managed = args.iter().any(|arg| arg == "--managed");
+    let args: Vec<String> = args.into_iter().filter(|arg| arg != "--managed").collect();
     let mut selected_avd = None;
     let mut selected_serial = None;
     for arg in args {
@@ -526,7 +546,7 @@ fn doctor(args: Vec<String>) -> io::Result<()> {
     }
 
     let mut failures = 0usize;
-    let sdk = match avd::sdk_dir() {
+    let sdk = match avd::sdk_dir_mode(managed) {
         Ok(path) => {
             report_check("PASS", &format!("Android SDK: {}", path.display()));
             Some(path)
@@ -631,7 +651,7 @@ fn doctor(args: Vec<String>) -> io::Result<()> {
             None
         }
     };
-    match avd::list() {
+    match avd::list_mode(managed) {
         Ok(avds) => report_check("PASS", &format!("installed AVDs: {}", avds.len())),
         Err(error) => {
             report_check("FAIL", &format!("installed AVDs: {error}"));
@@ -640,7 +660,7 @@ fn doctor(args: Vec<String>) -> io::Result<()> {
     }
 
     if let Some(name) = selected_avd {
-        match avd::inspect(&name) {
+        match avd::inspect_mode(&name, managed) {
             Ok(info) => {
                 report_check("PASS", &format!("AVD config: {}", name));
                 if info.image.is_dir() {
@@ -1302,7 +1322,12 @@ fn watch_target_matches(target: Option<&str>, serial: &str) -> bool {
     target.is_none_or(|target| target == serial)
 }
 fn print_help() {
-    println!("emutrim {}\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL]\n  emutrim start <AVD> [--ram=N] [--no-slim] [--timings] [--cold-boot]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--ram=N]\n  emutrim list-avds\n  emutrim --version, -V\n\nstart launches and waits for Android boot, then slims unless --no-slim is set. --timings reports startup phases; --cold-boot bypasses Quick Boot for that launch.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.", env!("CARGO_PKG_VERSION"));
+    let managed_root = if cfg!(windows) {
+        "%USERPROFILE%\\.emutrim"
+    } else {
+        "~/.emutrim"
+    };
+    println!("emutrim {}\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL] [--managed]\n  emutrim start <AVD> [--managed] [--ram=N] [--no-slim] [--timings] [--cold-boot]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--managed] [--ram=N]\n  emutrim list-avds [--managed]\n  emutrim managed root|status|setup|clean [--yes]\n  emutrim --version, -V\n\nDefault EmuTrim managed root: {managed_root}; override: EMUTRIM_HOME.\nstart launches and waits for Android boot, then slims unless --no-slim is set. --timings reports startup phases; --cold-boot bypasses Quick Boot for that launch.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.", env!("CARGO_PKG_VERSION"));
 }
 
 #[cfg(test)]

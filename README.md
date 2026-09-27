@@ -6,6 +6,8 @@ Windows is the currently supported runtime platform. CI also builds and tests po
 
 ## Quick start
 
+EmuTrim managed Android assets are a development/pre-1.0 feature. They live under `~/.emutrim/managed` by default; set `EMUTRIM_HOME` to choose another EmuTrim-owned root. Existing Android SDKs and AVDs remain user-owned and are never removed by managed cleanup.
+
 ```powershell
 emutrim doctor
 emutrim list-avds
