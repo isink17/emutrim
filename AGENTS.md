@@ -29,6 +29,7 @@ Safety order: physical target refusal; resolved emulator identity; boot complete
 
 - Canonical branch: `master`. Do not create or migrate work to `main`.
 - Inspect status before and after. Preserve unrelated user changes.
+- Before committing, ensure this repository uses `isink17 <39876158+isink17@users.noreply.github.com>`; never commit with a corporate/work email. When identity is uncertain, verify `git config --local user.email`, `git var GIT_AUTHOR_IDENT`, and `git var GIT_COMMITTER_IDENT`.
 - Do not commit, push, or add attribution trailers unless explicitly requested.
 
 ## Repo skills
