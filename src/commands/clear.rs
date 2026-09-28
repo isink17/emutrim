@@ -62,7 +62,7 @@ fn requires_terminal(interactive_form: bool, stdin_terminal: bool, stdout_termin
 
 fn execute(plan: ClearPlan, ops: &impl ClearOps) -> io::Result<()> {
     plan.check_running(ops)?;
-    plan.execute()?;
+    plan.execute_with(ops)?;
     println!("managed AVD resources removed");
     Ok(())
 }

@@ -218,6 +218,15 @@ const LAST_CONSOLE_PORT: u16 = 5682;
 pub(crate) trait ClearOps {
     fn console_owner(&self, port: u16) -> io::Result<Option<u32>>;
     fn console_avd_name(&self, port: u16) -> io::Result<String>;
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        fs::remove_dir_all(path)
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+    fn replace_manifest(&self, from: &Path, to: &Path) -> io::Result<()> {
+        replace_file(from, to)
+    }
 }
 
 pub(crate) struct SystemClearOps;
@@ -557,7 +566,7 @@ impl ClearPlan {
         Ok(())
     }
 
-    pub(crate) fn execute(mut self) -> io::Result<()> {
+    pub(crate) fn execute_with(mut self, ops: &impl ClearOps) -> io::Result<()> {
         validate_manifest_file(&self.layout)?;
         if self.targets.is_empty() {
             return Ok(());
@@ -580,19 +589,19 @@ impl ClearPlan {
         let prepared_manifest = prepare_manifest(&self.layout.manifest, &self.manifest)?;
         for target in &self.targets {
             if target.avd_dir.exists() {
-                if let Err(error) = fs::remove_dir_all(&target.avd_dir) {
+                if let Err(error) = ops.remove_dir_all(&target.avd_dir) {
                     let _ = fs::remove_file(&prepared_manifest);
                     return Err(error);
                 }
             }
             if target.ini.exists() {
-                if let Err(error) = fs::remove_file(&target.ini) {
+                if let Err(error) = ops.remove_file(&target.ini) {
                     let _ = fs::remove_file(&prepared_manifest);
                     return Err(error);
                 }
             }
         }
-        let result = replace_file(&prepared_manifest, &self.layout.manifest);
+        let result = ops.replace_manifest(&prepared_manifest, &self.layout.manifest);
         if result.is_err() {
             let _ = fs::remove_file(&prepared_manifest);
         }
@@ -960,6 +969,38 @@ mod tests {
         }
     }
 
+    struct FailingMutation {
+        fail_dir: Option<String>,
+        fail_manifest: bool,
+    }
+    impl ClearOps for FailingMutation {
+        fn console_owner(&self, _: u16) -> io::Result<Option<u32>> {
+            Ok(None)
+        }
+        fn console_avd_name(&self, _: u16) -> io::Result<String> {
+            unreachable!()
+        }
+        fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+            if self.fail_dir.as_deref() == path.file_name().and_then(|name| name.to_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected delete failure",
+                ));
+            }
+            fs::remove_dir_all(path)
+        }
+        fn replace_manifest(&self, from: &Path, to: &Path) -> io::Result<()> {
+            if self.fail_manifest {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected manifest replace failure",
+                ))
+            } else {
+                replace_file(from, to)
+            }
+        }
+    }
+
     #[test]
     fn layout_uses_override_and_platform_defaults() {
         let override_layout = Layout::resolve_from(
@@ -1046,7 +1087,7 @@ mod tests {
         assert_eq!(plan.targets().len(), 1);
         assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
         assert!(plan.check_running(&NoConsoles).is_ok());
-        plan.execute().unwrap();
+        plan.execute_with(&NoConsoles).unwrap();
         assert!(!layout.avd.join("Alpha.avd").exists());
         assert!(!layout.avd.join("Alpha.ini").exists());
         assert!(layout.avd.join("Beta.avd").exists());
@@ -1120,7 +1161,7 @@ mod tests {
         fs::remove_file(layout.avd.join("Alpha.ini")).unwrap();
         assert!(plan_clear(&layout, Some("Alpha"))
             .unwrap()
-            .execute()
+            .execute_with(&NoConsoles)
             .is_ok());
         assert_eq!(
             plan_clear(&layout, Some("Missing")).unwrap_err().kind(),
@@ -1170,7 +1211,10 @@ mod tests {
         fs::write(external.join("Alpha.ini"), b"external definition").unwrap();
         fs::write(external.join("userdata.img"), b"external data").unwrap();
         fs::write(layout.sdk.join("system-images/image/sentinel"), b"image").unwrap();
-        plan_clear(&layout, None).unwrap().execute().unwrap();
+        plan_clear(&layout, None)
+            .unwrap()
+            .execute_with(&NoConsoles)
+            .unwrap();
         assert!(!layout.avd.join("Alpha.avd").exists());
         assert!(!layout.avd.join("Beta.avd").exists());
         assert_eq!(
@@ -1197,7 +1241,7 @@ mod tests {
         let before = fs::read(&layout.manifest).unwrap();
         let plan = plan_clear(&layout, None).unwrap();
         assert!(plan.targets().is_empty());
-        plan.execute().unwrap();
+        plan.execute_with(&NoConsoles).unwrap();
         assert_eq!(fs::read(&layout.manifest).unwrap(), before);
         assert_eq!(
             plan_clear(&layout, Some("Missing")).unwrap_err().kind(),
@@ -1258,10 +1302,56 @@ mod tests {
         let original = layout.manifest.with_extension("original");
         fs::rename(&layout.manifest, &original).unwrap();
         fs::create_dir(&layout.manifest).unwrap();
-        assert!(plan.execute().is_err());
+        assert!(plan.execute_with(&NoConsoles).is_err());
         assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
         fs::remove_dir(&layout.manifest).unwrap();
         fs::rename(original, &layout.manifest).unwrap();
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
+    fn deletion_failure_keeps_manifest_authoritative_and_retryable() {
+        let layout = clear_fixture(&["Alpha", "Beta"]);
+        let before = fs::read(&layout.manifest).unwrap();
+        let plan = plan_clear(&layout, None).unwrap();
+        let ops = FailingMutation {
+            fail_dir: Some("Beta.avd".into()),
+            fail_manifest: false,
+        };
+        assert!(plan.execute_with(&ops).is_err());
+        assert!(!layout.avd.join("Alpha.avd").exists());
+        assert!(layout.avd.join("Beta.avd/userdata.img").exists());
+        assert_eq!(fs::read(&layout.manifest).unwrap(), before);
+        plan_clear(&layout, None)
+            .unwrap()
+            .execute_with(&NoConsoles)
+            .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&layout.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["avds"], serde_json::json!([]));
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
+    fn manifest_replace_failure_leaves_old_record_for_safe_retry() {
+        let layout = clear_fixture(&["Alpha"]);
+        let before = fs::read(&layout.manifest).unwrap();
+        let plan = plan_clear(&layout, None).unwrap();
+        let ops = FailingMutation {
+            fail_dir: None,
+            fail_manifest: true,
+        };
+        assert!(plan.execute_with(&ops).is_err());
+        assert!(!layout.avd.join("Alpha.avd").exists());
+        assert!(!layout.avd.join("Alpha.ini").exists());
+        assert_eq!(fs::read(&layout.manifest).unwrap(), before);
+        plan_clear(&layout, None)
+            .unwrap()
+            .execute_with(&NoConsoles)
+            .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&layout.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["avds"], serde_json::json!([]));
         fs::remove_dir_all(layout.root).unwrap();
     }
 
