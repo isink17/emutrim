@@ -94,6 +94,7 @@ fn run() -> io::Result<()> {
             }
         }
         "stop" => commands::stop::run(args),
+        "clear" => commands::clear::run(args),
         "doctor" => doctor(args),
         "stats" => stats(args),
         "list-avds" => {

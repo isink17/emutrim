@@ -1,7 +1,8 @@
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 #[derive(Clone, Debug)]
@@ -183,6 +184,477 @@ fn clean(layout: &Layout, yes: bool) -> io::Result<()> {
     }
     println!("managed payloads removed");
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClearTarget {
+    name: String,
+    avd_dir: PathBuf,
+    ini: PathBuf,
+}
+
+impl ClearTarget {
+    pub(crate) fn name(&self) -> String {
+        self.name.clone()
+    }
+    pub(crate) fn avd_dir(&self) -> &Path {
+        &self.avd_dir
+    }
+    pub(crate) fn ini(&self) -> &Path {
+        &self.ini
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClearPlan {
+    layout: Layout,
+    manifest: serde_json::Value,
+    targets: Vec<ClearTarget>,
+}
+
+const FIRST_CONSOLE_PORT: u16 = 5554;
+const LAST_CONSOLE_PORT: u16 = 5682;
+
+pub(crate) trait ClearOps {
+    fn console_owner(&self, port: u16) -> io::Result<Option<u32>>;
+    fn console_avd_name(&self, port: u16) -> io::Result<String>;
+}
+
+pub(crate) struct SystemClearOps;
+
+impl ClearOps for SystemClearOps {
+    fn console_owner(&self, port: u16) -> io::Result<Option<u32>> {
+        crate::platform::console_owner_pid(port)
+    }
+    fn console_avd_name(&self, port: u16) -> io::Result<String> {
+        crate::avd::console::avd_name(port)
+    }
+}
+
+pub(crate) fn plan_clear(layout: &Layout, requested: Option<&str>) -> io::Result<ClearPlan> {
+    validate_manifest_file(layout)?;
+    let data = fs::read(&layout.manifest)?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&data).map_err(invalid_manifest)?;
+    let object = manifest
+        .as_object_mut()
+        .ok_or_else(|| invalid_manifest("manifest must be an object"))?;
+    if object.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(invalid_manifest("unsupported managed manifest schema"));
+    }
+    let names = object
+        .get("avds")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid_manifest("manifest avds must be an array"))?;
+    if names.is_empty() {
+        if let Some(name) = requested {
+            if !safe_avd_name(name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid managed AVD name",
+                ));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("managed AVD {name:?} not found"),
+            ));
+        }
+        return Ok(ClearPlan {
+            layout: layout.clone(),
+            manifest,
+            targets: Vec::new(),
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    let avd_root = canonical_avd_root(layout)?;
+    let mut targets = Vec::with_capacity(names.len());
+    for value in names {
+        let name = value
+            .as_str()
+            .filter(|name| safe_avd_name(name))
+            .ok_or_else(|| invalid_manifest("manifest contains invalid AVD identity"))?;
+        let identity_key = if cfg!(any(windows, target_os = "macos")) {
+            name.to_ascii_lowercase()
+        } else {
+            name.to_owned()
+        };
+        if !seen.insert(identity_key) {
+            return Err(invalid_manifest("duplicate AVD identity in manifest"));
+        }
+        let avd_dir = avd_root.join(format!("{name}.avd"));
+        let ini = avd_root.join(format!("{name}.ini"));
+        validate_owned_path(&avd_dir, &avd_root, true)?;
+        validate_owned_path(&ini, &avd_root, false)?;
+        if avd_dir.exists() || ini.exists() {
+            let ini_text = fs::read_to_string(&ini).map_err(|e| {
+                invalid_manifest(format!(
+                    "managed AVD {name:?} has no readable identity file: {e}"
+                ))
+            })?;
+            let recorded = ini_text
+                .lines()
+                .find_map(|line| line.strip_prefix("path="))
+                .ok_or_else(|| {
+                    invalid_manifest(format!("managed AVD {name:?} .ini has no path"))
+                })?;
+            let recorded_path = Path::new(recorded);
+            if !recorded_path.is_absolute()
+                || recorded_path
+                    .components()
+                    .any(|c| c == Component::ParentDir)
+                || if avd_dir.exists() {
+                    recorded_path.canonicalize()? != avd_dir.canonicalize()?
+                } else {
+                    recorded_path
+                        .parent()
+                        .and_then(|parent| parent.canonicalize().ok())
+                        .as_deref()
+                        != Some(avd_root.as_path())
+                        || recorded_path.file_name() != avd_dir.file_name()
+                }
+            {
+                return Err(invalid_manifest(format!(
+                    "managed AVD {name:?} .ini path is not its owned directory"
+                )));
+            }
+        }
+        targets.push(ClearTarget {
+            name: name.into(),
+            avd_dir,
+            ini,
+        });
+    }
+    let selected = if let Some(name) = requested {
+        if !safe_avd_name(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid managed AVD name",
+            ));
+        }
+        let Some(target) = targets.iter().find(|target| target.name == name).cloned() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("managed AVD {name:?} not found"),
+            ));
+        };
+        vec![target]
+    } else {
+        targets
+    };
+    Ok(ClearPlan {
+        layout: layout.clone(),
+        manifest,
+        targets: selected,
+    })
+}
+
+fn validate_manifest_file(layout: &Layout) -> io::Result<()> {
+    let managed = layout.managed.canonicalize()?;
+    let metadata = fs::symlink_metadata(&layout.manifest)?;
+    let expected = managed.join(layout.manifest.file_name().unwrap_or_default());
+    if is_link_or_reparse(&metadata)
+        || !metadata.is_file()
+        || layout
+            .manifest
+            .parent()
+            .and_then(|path| path.canonicalize().ok())
+            .as_deref()
+            != Some(managed.as_path())
+        || layout.manifest.canonicalize()? != expected
+    {
+        return Err(invalid_manifest(
+            "manifest file is outside managed metadata area or is a link",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_manifest(message: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("unsafe managed manifest: {message}"),
+    )
+}
+
+fn safe_avd_name(name: &str) -> bool {
+    let valid = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.ends_with('.')
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c));
+    if !valid {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let stem = name
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ["COM", "LPT"].iter().any(|prefix| {
+                stem.strip_prefix(prefix).is_some_and(|digit| {
+                    digit.len() == 1 && matches!(digit.as_bytes()[0], b'1'..=b'9')
+                })
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn canonical_avd_root(layout: &Layout) -> io::Result<PathBuf> {
+    let root = layout.root.canonicalize()?;
+    let managed = layout.managed.canonicalize()?;
+    let sdk = layout.sdk.canonicalize()?;
+    let avd = layout.avd.canonicalize()?;
+    if managed == root
+        || !managed.starts_with(&root)
+        || sdk == managed
+        || !sdk.starts_with(&managed)
+        || avd == managed
+        || avd == sdk
+        || !avd.starts_with(&managed)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "managed AVD root relationship is unsafe",
+        ));
+    }
+    for path in [&layout.root, &layout.managed, &layout.avd] {
+        if is_link_or_reparse(&fs::symlink_metadata(path)?) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "managed AVD root contains link",
+            ));
+        }
+    }
+    Ok(avd)
+}
+
+fn validate_owned_path(path: &Path, avd_root: &Path, directory: bool) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_manifest("owned path has no parent"))?;
+    if parent != avd_root || path == avd_root {
+        return Err(invalid_manifest("owned path escapes AVD home"));
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(meta) if is_link_or_reparse(&meta) => {
+            return Err(invalid_manifest(
+                "owned AVD path is a symlink or reparse point",
+            ))
+        }
+        Ok(meta) if directory && !meta.is_dir() => {
+            return Err(invalid_manifest("owned AVD payload is not a directory"))
+        }
+        Ok(meta) if !directory && !meta.is_file() => {
+            return Err(invalid_manifest("owned AVD definition is not a file"))
+        }
+        _ => {}
+    }
+    if directory {
+        validate_tree_no_links(path)?;
+    }
+    if path.canonicalize()? != path {
+        return Err(invalid_manifest("owned path has ambiguous canonical form"));
+    }
+    Ok(())
+}
+
+fn validate_tree_no_links(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    let device = {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(path)?.dev()
+    };
+    validate_tree_no_links_on_device(path, {
+        #[cfg(unix)]
+        {
+            Some(device)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    })
+}
+
+fn validate_tree_no_links_on_device(path: &Path, device: Option<u64>) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child)?;
+        if is_link_or_reparse(&metadata) {
+            return Err(invalid_manifest(format!(
+                "owned AVD tree contains link: {}",
+                child.display()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if Some(metadata.dev()) != device {
+                return Err(invalid_manifest(format!(
+                    "owned AVD tree crosses filesystem boundary: {}",
+                    child.display()
+                )));
+            }
+        }
+        if metadata.is_dir() {
+            validate_tree_no_links_on_device(&child, device)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_type().is_symlink() || has_reparse_attribute(metadata.file_attributes())
+}
+
+#[cfg(windows)]
+fn has_reparse_attribute(attributes: u32) -> bool {
+    attributes & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+impl ClearPlan {
+    pub(crate) fn targets(&self) -> &[ClearTarget] {
+        &self.targets
+    }
+    pub(crate) fn only(mut self, name: &str) -> Self {
+        self.targets.retain(|target| target.name == name);
+        self
+    }
+
+    pub(crate) fn check_running(&self, ops: &impl ClearOps) -> io::Result<()> {
+        let names: std::collections::HashSet<_> = self
+            .targets
+            .iter()
+            .map(|target| target.name.as_str())
+            .collect();
+        for port in (FIRST_CONSOLE_PORT..=LAST_CONSOLE_PORT).step_by(2) {
+            if ops.console_owner(port)?.is_none() {
+                continue;
+            }
+            let name = ops.console_avd_name(port).map_err(|error| io::Error::new(error.kind(), format!("cannot authenticate host-owned emulator console on {port}; refusing clear: {error}")))?;
+            if names.contains(name.as_str()) {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("Managed AVD {name:?} is running as emulator-{port}. Stop it first with: emutrim stop {name}")));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execute(mut self) -> io::Result<()> {
+        validate_manifest_file(&self.layout)?;
+        if self.targets.is_empty() {
+            return Ok(());
+        }
+        for target in &self.targets {
+            validate_owned_path(&target.avd_dir, &canonical_avd_root(&self.layout)?, true)?;
+            validate_owned_path(&target.ini, &canonical_avd_root(&self.layout)?, false)?;
+        }
+        let removed: std::collections::HashSet<_> = self
+            .targets
+            .iter()
+            .map(|target| target.name.as_str())
+            .collect();
+        let avds = self
+            .manifest
+            .get_mut("avds")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| invalid_manifest("manifest avds changed after validation"))?;
+        avds.retain(|entry| !entry.as_str().is_some_and(|name| removed.contains(name)));
+        let prepared_manifest = prepare_manifest(&self.layout.manifest, &self.manifest)?;
+        for target in &self.targets {
+            if target.avd_dir.exists() {
+                if let Err(error) = fs::remove_dir_all(&target.avd_dir) {
+                    let _ = fs::remove_file(&prepared_manifest);
+                    return Err(error);
+                }
+            }
+            if target.ini.exists() {
+                if let Err(error) = fs::remove_file(&target.ini) {
+                    let _ = fs::remove_file(&prepared_manifest);
+                    return Err(error);
+                }
+            }
+        }
+        let result = replace_file(&prepared_manifest, &self.layout.manifest);
+        if result.is_err() {
+            let _ = fs::remove_file(&prepared_manifest);
+        }
+        result
+    }
+}
+
+fn prepare_manifest(path: &Path, value: &serde_json::Value) -> io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_manifest("manifest has no parent"))?;
+    let bytes = serde_json::to_vec_pretty(value).map_err(invalid_manifest)?;
+    let mut temp = None;
+    for suffix in 0..100 {
+        let candidate = parent.join(format!(".manifest-{}-{suffix}.tmp", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+                    drop(file);
+                    let _ = fs::remove_file(&candidate);
+                    return Err(error);
+                }
+                temp = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let temp = temp.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "cannot allocate manifest temp file",
+        )
+    })?;
+    Ok(temp)
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0x1 | 0x8) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn emulator_pids(processes: &str, emulator_dir: &Path) -> Vec<String> {
@@ -413,6 +885,81 @@ fn setup(layout: &Layout) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn clear_fixture(names: &[&str]) -> Layout {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = env::temp_dir().join(format!(
+            "emutrim-clear-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let managed = root.join("managed");
+        let layout = Layout {
+            root,
+            managed: managed.clone(),
+            sdk: managed.join("sdk"),
+            avd: managed.join("avd"),
+            tmp: managed.join("tmp"),
+            manifest: managed.join("manifest.json"),
+        };
+        let _ = fs::remove_dir_all(&layout.root);
+        fs::create_dir_all(layout.sdk.join("system-images/image")).unwrap();
+        fs::create_dir_all(layout.sdk.join("platform-tools")).unwrap();
+        fs::create_dir_all(layout.sdk.join("cmdline-tools")).unwrap();
+        fs::create_dir_all(layout.avd.join("..")).unwrap();
+        for name in names {
+            let avd = layout.avd.join(format!("{name}.avd"));
+            fs::create_dir_all(&avd).unwrap();
+            fs::write(avd.join("userdata.img"), b"mutable data").unwrap();
+            fs::write(
+                layout.avd.join(format!("{name}.ini")),
+                format!("path={}\n", avd.display()),
+            )
+            .unwrap();
+        }
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "sdk_packages": ["cmdline-tools;latest", "platform-tools", "emulator", "system-images;android-35;google_apis;arm64-v8a"],
+            "system_image": "system-images;android-35;google_apis;arm64-v8a",
+            "arch": "arm64-v8a",
+            "host": "macos-aarch64",
+            "avds": names,
+            "other_metadata": {"keep": true}
+        });
+        fs::write(&layout.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        layout
+    }
+
+    #[derive(Default)]
+    struct NoConsoles;
+    impl ClearOps for NoConsoles {
+        fn console_owner(&self, _: u16) -> io::Result<Option<u32>> {
+            Ok(None)
+        }
+        fn console_avd_name(&self, _: u16) -> io::Result<String> {
+            unreachable!()
+        }
+    }
+
+    struct OneConsole {
+        name: Option<&'static str>,
+        auth_fails: bool,
+    }
+    impl ClearOps for OneConsole {
+        fn console_owner(&self, port: u16) -> io::Result<Option<u32>> {
+            Ok((port == 5554).then_some(1234))
+        }
+        fn console_avd_name(&self, _: u16) -> io::Result<String> {
+            if self.auth_fails {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "auth failed",
+                ))
+            } else {
+                Ok(self.name.unwrap_or("Other").into())
+            }
+        }
+    }
+
     #[test]
     fn layout_uses_override_and_platform_defaults() {
         let override_layout = Layout::resolve_from(
@@ -488,5 +1035,241 @@ mod tests {
             ),
             ["14454"]
         );
+    }
+
+    #[test]
+    fn clear_plan_is_dry_until_execute_and_preserves_sdk_metadata() {
+        let layout = clear_fixture(&["Alpha", "Beta"]);
+        fs::write(layout.sdk.join("system-images/image/sentinel"), b"image").unwrap();
+        fs::write(layout.sdk.join("platform-tools/sentinel"), b"tools").unwrap();
+        let plan = plan_clear(&layout, Some("Alpha")).unwrap();
+        assert_eq!(plan.targets().len(), 1);
+        assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
+        assert!(plan.check_running(&NoConsoles).is_ok());
+        plan.execute().unwrap();
+        assert!(!layout.avd.join("Alpha.avd").exists());
+        assert!(!layout.avd.join("Alpha.ini").exists());
+        assert!(layout.avd.join("Beta.avd").exists());
+        assert_eq!(
+            fs::read(layout.sdk.join("system-images/image/sentinel")).unwrap(),
+            b"image"
+        );
+        assert_eq!(
+            fs::read(layout.sdk.join("platform-tools/sentinel")).unwrap(),
+            b"tools"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&layout.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["avds"], serde_json::json!(["Beta"]));
+        assert_eq!(manifest["other_metadata"]["keep"], true);
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
+    fn clear_all_rejects_late_unsafe_entry_before_any_deletion() {
+        let layout = clear_fixture(&["Alpha"]);
+        let outside = layout.root.with_file_name("outside-clear-sentinel.txt");
+        fs::write(&outside, b"untouched").unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&layout.manifest).unwrap()).unwrap();
+        manifest["avds"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("../outside"));
+        fs::write(&layout.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(plan_clear(&layout, None).is_err());
+        assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+        fs::remove_file(outside).unwrap();
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
+    fn clear_rejects_manifest_symlink_and_avd_tree_symlink() {
+        let layout = clear_fixture(&["Alpha"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = layout.root.with_file_name("outside-clear-tree");
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(outside.join("sentinel"), b"untouched").unwrap();
+            symlink(&outside, layout.avd.join("Alpha.avd/external")).unwrap();
+            assert!(plan_clear(&layout, Some("Alpha")).is_err());
+            assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"untouched");
+            fs::remove_file(layout.avd.join("Alpha.avd/external")).unwrap();
+            fs::remove_dir_all(outside).unwrap();
+
+            let original = layout.manifest.with_extension("original");
+            fs::rename(&layout.manifest, &original).unwrap();
+            let outside_manifest = layout.root.with_file_name("outside-clear-manifest.json");
+            fs::write(&outside_manifest, b"external manifest").unwrap();
+            symlink(&outside_manifest, &layout.manifest).unwrap();
+            assert!(plan_clear(&layout, Some("Alpha")).is_err());
+            assert_eq!(fs::read(&outside_manifest).unwrap(), b"external manifest");
+            fs::remove_file(&layout.manifest).unwrap();
+            fs::rename(original, &layout.manifest).unwrap();
+            fs::remove_file(outside_manifest).unwrap();
+        }
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
+    fn missing_owned_files_are_idempotent_and_unknown_target_refuses() {
+        let layout = clear_fixture(&["Alpha"]);
+        fs::remove_dir_all(layout.avd.join("Alpha.avd")).unwrap();
+        fs::remove_file(layout.avd.join("Alpha.ini")).unwrap();
+        assert!(plan_clear(&layout, Some("Alpha"))
+            .unwrap()
+            .execute()
+            .is_ok());
+        assert_eq!(
+            plan_clear(&layout, Some("Missing")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
+    fn running_exact_target_and_auth_uncertainty_refuse_before_mutation() {
+        let layout = clear_fixture(&["Alpha"]);
+        let plan = plan_clear(&layout, Some("Alpha")).unwrap();
+        assert!(plan
+            .check_running(&OneConsole {
+                name: Some("Alpha"),
+                auth_fails: false
+            })
+            .is_err());
+        assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
+        let plan = plan_clear(&layout, Some("Alpha")).unwrap();
+        assert!(plan
+            .check_running(&OneConsole {
+                name: None,
+                auth_fails: true
+            })
+            .is_err());
+        assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_schema_and_malformed_json_refuse() {
+        let layout = clear_fixture(&["Alpha"]);
+        fs::write(&layout.manifest, b"{").unwrap();
+        assert!(plan_clear(&layout, None).is_err());
+        fs::write(&layout.manifest, br#"{"schema":99,"avds":["Alpha"]}"#).unwrap();
+        assert!(plan_clear(&layout, None).is_err());
+        assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
+    fn clear_all_success_preserves_managed_sdk_and_external_same_name() {
+        let layout = clear_fixture(&["Alpha", "Beta"]);
+        let external = layout.root.with_file_name("external-avd");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("Alpha.ini"), b"external definition").unwrap();
+        fs::write(external.join("userdata.img"), b"external data").unwrap();
+        fs::write(layout.sdk.join("system-images/image/sentinel"), b"image").unwrap();
+        plan_clear(&layout, None).unwrap().execute().unwrap();
+        assert!(!layout.avd.join("Alpha.avd").exists());
+        assert!(!layout.avd.join("Beta.avd").exists());
+        assert_eq!(
+            fs::read(external.join("Alpha.ini")).unwrap(),
+            b"external definition"
+        );
+        assert_eq!(
+            fs::read(external.join("userdata.img")).unwrap(),
+            b"external data"
+        );
+        assert_eq!(
+            fs::read(layout.sdk.join("system-images/image/sentinel")).unwrap(),
+            b"image"
+        );
+        assert!(plan_clear(&layout, None).unwrap().targets().is_empty());
+        fs::remove_dir_all(external).unwrap();
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
+    fn empty_managed_avd_state_is_successful_noop() {
+        let layout = clear_fixture(&[]);
+        fs::remove_dir_all(&layout.sdk).unwrap();
+        let before = fs::read(&layout.manifest).unwrap();
+        let plan = plan_clear(&layout, None).unwrap();
+        assert!(plan.targets().is_empty());
+        plan.execute().unwrap();
+        assert_eq!(fs::read(&layout.manifest).unwrap(), before);
+        assert_eq!(
+            plan_clear(&layout, Some("Missing")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
+    fn outside_ini_path_duplicate_identity_and_path_injection_refuse() {
+        for bad in [
+            "../outside",
+            "foo/../../bar",
+            ".",
+            "",
+            "/",
+            "C:\\outside",
+            "trailing.",
+        ] {
+            assert!(!safe_avd_name(bad));
+        }
+        let layout = clear_fixture(&["Alpha"]);
+        fs::write(layout.avd.join("Alpha.ini"), "path=/tmp/external-avd\n").unwrap();
+        assert!(plan_clear(&layout, Some("Alpha")).is_err());
+        assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&layout.manifest).unwrap()).unwrap();
+        manifest["avds"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("Alpha"));
+        fs::write(&layout.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(plan_clear(&layout, None).is_err());
+        assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn case_ambiguous_manifest_names_refuse() {
+        let layout = clear_fixture(&["Alpha"]);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&layout.manifest).unwrap()).unwrap();
+        manifest["avds"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("alpha"));
+        fs::write(&layout.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(plan_clear(&layout, None).is_err());
+        assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rechecks_paths_before_first_deletion() {
+        let layout = clear_fixture(&["Alpha"]);
+        let plan = plan_clear(&layout, None).unwrap();
+        let original = layout.manifest.with_extension("original");
+        fs::rename(&layout.manifest, &original).unwrap();
+        fs::create_dir(&layout.manifest).unwrap();
+        assert!(plan.execute().is_err());
+        assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
+        fs::remove_dir(&layout.manifest).unwrap();
+        fs::rename(original, &layout.manifest).unwrap();
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_classification_checks_attribute_flag() {
+        assert!(has_reparse_attribute(0x400));
+        assert!(has_reparse_attribute(0x400 | 0x10));
+        assert!(!has_reparse_attribute(0x10));
     }
 }

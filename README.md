@@ -89,6 +89,7 @@ Customize `slim` with repeatable options:
 | `managed status` | Report isolated managed SDK/AVD setup. |
 | `managed setup` | Set up managed Android assets; currently supported on Apple Silicon macOS. |
 | `managed clean [--yes]` | Preview managed cleanup; `--yes` deletes managed payloads. |
+| `clear [AVD_NAME|all] [--yes]` | Preview or remove only positively identified EmuTrim-managed AVD definitions and their mutable files. |
 
 `off` and `restore` accept an optional serial; without one, EmuTrim selects the sole running emulator and refuses ambiguity. `--ram=N` is in MB. `--cold-boot` does not wipe data or delete snapshots. `--timings` reports startup phases.
 
@@ -107,11 +108,18 @@ By default, EmuTrim stores its root at `~/.emutrim`; managed SDK and AVD payload
 ```sh
 emutrim managed setup
 emutrim managed status
+emutrim start My_AVD --managed
+emutrim status emulator-5554
+emutrim stop My_AVD
+emutrim clear My_AVD
+emutrim clear My_AVD --yes
 emutrim managed clean
 emutrim managed clean --yes
 ```
 
-`managed clean --yes` deletes only EmuTrim-owned managed payloads. It does not delete the user's Android Studio SDK or external AVDs. Cleanup refuses to run while a managed emulator is running.
+`clear AVD_NAME` and `clear all` validate and print a dry-run plan; add `--yes` to delete. Bare `clear` uses an interactive managed-AVD selector and confirmation. `clear` removes only manifest-identified EmuTrim AVD definitions (`.ini`) and each AVD's mutable `.avd` directory. It never removes external AVDs, SDK packages, or system images. Running AVDs and uncertain console authentication are refused; stop explicitly before clearing. `clear all --yes` preflights every target before deleting any AVD.
+
+`managed clean --yes` has broader scope: it deletes the full EmuTrim-managed payload, including managed SDK and system images. `clear all --yes` preserves that environment so setup remains reusable.
 
 ## Safety model
 
