@@ -486,7 +486,7 @@ fn validate_tree_no_links(path: &Path) -> io::Result<()> {
     })
 }
 
-fn validate_tree_no_links_on_device(path: &Path, device: Option<u64>) -> io::Result<()> {
+fn validate_tree_no_links_on_device(path: &Path, _device: Option<u64>) -> io::Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let child = entry.path();
@@ -500,7 +500,7 @@ fn validate_tree_no_links_on_device(path: &Path, device: Option<u64>) -> io::Res
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if Some(metadata.dev()) != device {
+            if Some(metadata.dev()) != _device {
                 return Err(invalid_manifest(format!(
                     "owned AVD tree crosses filesystem boundary: {}",
                     child.display()
@@ -508,7 +508,7 @@ fn validate_tree_no_links_on_device(path: &Path, device: Option<u64>) -> io::Res
             }
         }
         if metadata.is_dir() {
-            validate_tree_no_links_on_device(&child, device)?;
+            validate_tree_no_links_on_device(&child, _device)?;
         }
     }
     Ok(())
