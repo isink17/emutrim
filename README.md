@@ -78,7 +78,7 @@ Customize `slim` with repeatable options:
 | `restore [SERIAL]` | Restore recorded package and setting state; retry incomplete restores safely. |
 | `watch [--serial=SERIAL]` | Watch ADB device events and slim eligible emulator connections; `--dry-run` reports without mutation. |
 | `stats <SERIAL> [--seconds=N]` | Read Windows process working set, private memory, CPU, threads, and handles. Unsupported on macOS. |
-| `tune-avd [AVD] [--managed] [--ram=N]` | Update AVD RAM/GPU settings after backing up `config.ini`; omitting AVD works only when exactly one is installed in selected environment. |
+| `tune-avd [AVD] [--managed] [--ram=N]` | Update AVD RAM/GPU settings after backing up `config.ini`; without `--ram`, selects 4096 MB for detected 16 KB images and 1536 MB for other configured images. Missing image paths fail safely. Omitting AVD works only when exactly one is installed in selected environment. |
 | `managed root` | Print EmuTrim data root. |
 | `managed status` | Report isolated managed SDK/AVD setup. |
 | `managed setup` | Set up managed Android assets; currently supported on Apple Silicon macOS. |

@@ -1,5 +1,6 @@
 mod adb;
 mod avd;
+mod cli;
 mod managed;
 mod platform;
 mod slim;
@@ -42,6 +43,10 @@ fn run() -> io::Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".into());
     let args: Vec<_> = args.collect();
+    if let Some(help) = cli::command_help(&command, &args) {
+        println!("{help}");
+        return Ok(());
+    }
     match command.as_str() {
         "--version" | "-V" => {
             println!("emutrim {}", env!("CARGO_PKG_VERSION"));
@@ -90,7 +95,7 @@ fn run() -> io::Result<()> {
             Ok(())
         }
         "help" | "--help" | "-h" => {
-            print_help();
+            cli::print_help();
             Ok(())
         }
         other => Err(io::Error::new(
@@ -190,14 +195,15 @@ fn avd_args(
     verb: &str,
     require_name: bool,
     managed: bool,
-) -> io::Result<(String, u32)> {
+) -> io::Result<(String, Option<u32>)> {
     let mut name = None;
-    let mut ram = 1536;
+    let mut ram = None;
     for arg in args {
         if let Some(v) = arg.strip_prefix("--ram=") {
-            ram = v
-                .parse()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid --ram"))?;
+            ram = Some(
+                v.parse()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid --ram"))?,
+            );
         } else if !arg.starts_with('-') {
             name = Some(arg);
         } else {
@@ -909,6 +915,24 @@ mod cli_tests {
     use super::*;
 
     #[test]
+    fn tune_avd_arguments_leave_default_selection_to_avd_config() {
+        assert_eq!(
+            avd_args(vec!["Test_AVD".into()], "tune-avd", false, false).unwrap(),
+            ("Test_AVD".into(), None)
+        );
+        assert_eq!(
+            avd_args(
+                vec!["Test_AVD".into(), "--ram=5120".into()],
+                "tune-avd",
+                false,
+                false
+            )
+            .unwrap(),
+            ("Test_AVD".into(), Some(5120))
+        );
+    }
+
+    #[test]
     fn stats_arguments_and_memory_conversion_are_bounded() {
         assert_eq!(
             stats_args(vec!["emulator-5556".into()]).unwrap(),
@@ -1321,22 +1345,6 @@ fn wait_for_boot_until(
 fn watch_target_matches(target: Option<&str>, serial: &str) -> bool {
     target.is_none_or(|target| target == serial)
 }
-fn print_help() {
-    let managed_root = if cfg!(windows) {
-        "%USERPROFILE%\\.emutrim"
-    } else {
-        "~/.emutrim"
-    };
-    let stats_note = if cfg!(windows) {
-        "stats reports Windows process metrics."
-    } else if cfg!(target_os = "macos") {
-        "stats is not supported on macOS."
-    } else {
-        "stats is not available on this platform."
-    };
-    println!("emutrim {}\n\nUsage:\n  emutrim doctor [AVD] [--serial=SERIAL] [--managed]\n  emutrim start <AVD> [--managed] [--ram=N] [--no-slim] [--timings] [--cold-boot]\n  emutrim watch [--serial=SERIAL] [--dry-run]\n  emutrim slim [SERIAL] [--dry-run] [--keep=PACKAGE] [--skip=GROUP]\n  emutrim restore [SERIAL]\n  emutrim off [SERIAL]\n  emutrim stats <SERIAL> [--seconds=N]\n  emutrim tune-avd [AVD] [--managed] [--ram=N]\n  emutrim list-avds [--managed]\n  emutrim managed root|status|setup|clean [--yes]\n  emutrim --version, -V\n\nDefault EmuTrim managed root: {managed_root}; override: EMUTRIM_HOME.\nstart launches and waits for Android boot, then slims unless --no-slim is set. --timings reports startup phases; --cold-boot bypasses Quick Boot for that launch.\nGuest mutation requires verified emulator identity and completed boot. Runtime ADB uses the smart socket; no adb.exe subprocess.\n{stats_note}", env!("CARGO_PKG_VERSION"));
-}
-
 #[cfg(test)]
 mod target_tests {
     use super::*;

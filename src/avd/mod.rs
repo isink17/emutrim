@@ -256,7 +256,11 @@ fn parse_ram_mb(value: &str) -> Option<u32> {
 }
 
 pub fn validate_ram(info: &AvdInfo, ram_mb: u32) -> io::Result<()> {
-    if info.is_16k && ram_mb < 4096 {
+    validate_ram_for_image(info.is_16k, ram_mb)
+}
+
+fn validate_ram_for_image(is_16k: bool, ram_mb: u32) -> io::Result<()> {
+    if is_16k && ram_mb < 4096 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "16 KB system image requires at least 4096 MB; refusing incompatible --ram",
@@ -300,18 +304,24 @@ pub fn console_port(serial: &str) -> Option<u16> {
     let port = serial.strip_prefix("emulator-")?.parse::<u16>().ok()?;
     ((5554..=5682).contains(&port) && port % 2 == 0).then_some(port)
 }
-pub fn tune_mode(name: &str, ram: u32, managed: bool) -> io::Result<()> {
+pub fn tune_mode(name: &str, ram: Option<u32>, managed: bool) -> io::Result<()> {
     tune_file(&config_path_mode(name, managed)?, ram)
 }
-fn tune_file(path: &PathBuf, ram: u32) -> io::Result<()> {
+fn tune_file(path: &PathBuf, requested_ram: Option<u32>) -> io::Result<()> {
     let text = fs::read_to_string(path)?;
     let config = parse(&text);
-    if is_16k(&config) && ram < 4096 {
+    if config
+        .get("image.sysdir.1")
+        .is_none_or(|image| image.is_empty())
+    {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "16 KB system image requires at least 4096 MB; refusing incompatible --ram",
+            io::ErrorKind::InvalidData,
+            "AVD config has no system image path",
         ));
     }
+    let is_16k = is_16k(&config);
+    let ram = requested_ram.unwrap_or(if is_16k { 4096 } else { 1536 });
+    validate_ram_for_image(is_16k, ram)?;
     let backup = path.with_extension("ini.emutrim.bak");
     if !backup.exists() {
         fs::write(&backup, &text)?;
@@ -526,19 +536,75 @@ mod tests {
         ));
         fs::write(
             &path,
-            "hw.ramSize=2048\ncustom.key=keep\nhw.gpu.mode=auto\n",
+            "hw.ramSize=2048\ncustom.key=keep\nhw.gpu.mode=auto\nhw.audioInput=no\nhw.camera.back=none\nimage.sysdir.1=system-images;android-31;google_apis;x86_64\n",
         )
         .unwrap();
-        tune_file(&path, 1536).unwrap();
+        tune_file(&path, Some(1536)).unwrap();
         let edited = fs::read_to_string(&path).unwrap();
         assert!(edited.contains("hw.ramSize=1536\n"));
         assert!(edited.contains("hw.gpu.mode=host\n"));
         assert!(edited.contains("custom.key=keep\n"));
+        assert!(edited.contains("hw.audioInput=no\n"));
+        assert!(edited.contains("hw.camera.back=none\n"));
         assert_eq!(
             fs::read_to_string(path.with_extension("ini.emutrim.bak")).unwrap(),
-            "hw.ramSize=2048\ncustom.key=keep\nhw.gpu.mode=auto\n"
+            "hw.ramSize=2048\ncustom.key=keep\nhw.gpu.mode=auto\nhw.audioInput=no\nhw.camera.back=none\nimage.sysdir.1=system-images;android-31;google_apis;x86_64\n"
         );
         let _ = fs::remove_file(path.with_extension("ini.emutrim.bak"));
+        let _ = fs::remove_file(path);
+    }
+
+    fn temp_config(text: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!(
+            "emutrim-{}-config.ini",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn tune_defaults_ram_from_detected_image_page_size() {
+        for (image, expected) in [
+            ("system-images;android-31;google_apis;x86_64", "1536"),
+            ("system-images;android-37;google_apis_ps16k;x86_64", "4096"),
+        ] {
+            let path = temp_config(&format!("image.sysdir.1={image}\n"));
+            tune_file(&path, None).unwrap();
+            assert!(fs::read_to_string(&path)
+                .unwrap()
+                .contains(&format!("hw.ramSize={expected}\n")));
+            let _ = fs::remove_file(path.with_extension("ini.emutrim.bak"));
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn tune_accepts_explicit_ram_and_rejects_invalid_16k_values_before_backup() {
+        let path =
+            temp_config("image.sysdir.1=system-images;android-37;google_apis_ps16k;x86_64\n");
+        let original = fs::read_to_string(&path).unwrap();
+        assert!(tune_file(&path, Some(1536)).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.with_extension("ini.emutrim.bak").exists());
+        tune_file(&path, Some(5120)).unwrap();
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("hw.ramSize=5120\n"));
+        let _ = fs::remove_file(path.with_extension("ini.emutrim.bak"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tune_rejects_unresolved_image_before_mutation() {
+        let path = temp_config("hw.ramSize=4096\ncustom.key=keep\n");
+        let original = fs::read_to_string(&path).unwrap();
+        assert!(tune_file(&path, None).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.with_extension("ini.emutrim.bak").exists());
         let _ = fs::remove_file(path);
     }
 }
