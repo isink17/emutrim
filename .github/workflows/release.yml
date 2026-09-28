@@ -79,12 +79,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > release-notes.md <<'EOF'
-          EmuTrim 0.5.0
+          EmuTrim 0.5.1
 
-          - Improved README onboarding and command documentation, including slimming behavior.
-          - Added third-party notices and release packaging.
-          - Repository guidance now requires the personal GitHub noreply identity for commits.
-          - Licensing change: v0.5.0 and later is source-available under MIT with Commons Clause License Condition v1.0. v0.4.0 and earlier remain MIT.
+          Fixes:
+          - tune-avd selects 4096 MB by default for detected 16 KB images and 1536 MB for other configured images.
+          - Explicit RAM values retain existing validation; unresolved image configuration fails before backup or mutation.
+          - Added command-specific CLI help.
+
+          No emulator safety model changes. No new platform support.
 
           Platforms: Windows x86_64 and Apple Silicon macOS (arm64). macOS stats is not supported. Linux remains CI/core-only.
           EOF
