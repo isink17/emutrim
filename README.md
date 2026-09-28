@@ -1,18 +1,41 @@
 # EmuTrim
 
-EmuTrim is Rust tooling for Android Emulator startup, optimization, and diagnostics on Windows and Apple Silicon macOS.
+EmuTrim starts Android emulators, waits for the exact emulator to finish booting, diagnoses common SDK and AVD problems, and can apply a reversible slimming profile to development AVDs. Use it for one-command startup, readiness checks, safe restore, and isolated disposable Android environments.
 
-## Supported platforms
+## Why EmuTrim?
 
-- **Windows x86_64:** supported and live qualified.
-- **macOS Apple Silicon (arm64):** supported and live qualified. `stats` is currently unavailable.
-- **Linux:** portable/core code is verified by CI; Linux is not a first-class runtime target.
+- Start an AVD and wait for its Android boot to complete with one command.
+- Diagnose SDK, AVD, ADB, image, and RAM configuration with `doctor`.
+- Apply a reversible profile to a development emulator, then restore its recorded state exactly.
+- Keep disposable EmuTrim test assets isolated from Android Studio installations.
 
-Intel Mac and Linux runtime support are not claimed.
+EmuTrim does not promise RAM savings or general application-performance improvements.
+
+## Install
+
+### Release binaries
+
+Download the current release for Windows x86_64 or Apple Silicon macOS arm64 from [GitHub Releases](https://github.com/isink17/emutrim/releases). Extract the archive and run `emutrim.exe` on Windows or `./emutrim` on macOS. The macOS binary is unsigned; Gatekeeper may block its first launch. Review the downloaded binary and use macOS's per-app approval flow if you choose to run it. Do not disable Gatekeeper globally.
+
+### Cargo from source
+
+Install the latest source from the repository:
+
+```sh
+cargo install --git https://github.com/isink17/emutrim emutrim
+```
+
+For a reproducible version, install the release tag:
+
+```sh
+cargo install --git https://github.com/isink17/emutrim --tag v0.5.0 emutrim
+```
+
+EmuTrim is not published on crates.io.
 
 ## Quick start
 
-EmuTrim managed Android assets are a development/pre-1.0 feature. On macOS, normal external environments use `$HOME/Library/Android/sdk` and `$HOME/.android/avd`. Managed mode keeps its own SDK and AVD under `~/.emutrim` (payloads under `~/.emutrim/managed`); set `EMUTRIM_HOME` to choose another EmuTrim-owned root. `managed clean --yes` removes only EmuTrim-owned managed payloads, never Android Studio SDKs or external AVDs.
+An ADB server must already be running at `127.0.0.1:5037`. Android Studio often starts it automatically; otherwise run `<ANDROID_SDK>/platform-tools/adb start-server`.
 
 ```sh
 emutrim doctor
@@ -20,66 +43,112 @@ emutrim list-avds
 emutrim start My_AVD
 ```
 
-EmuTrim launches the SDK's emulator directly. It does not replace or shim Android Studio executables. macOS release binaries are unsigned; macOS may require the user to approve opening the downloaded app in Privacy & Security.
+`start` slims by default after the exact emulator finishes booting. For a completely non-mutating first boot, use `emutrim start My_AVD --no-slim`.
 
-`start` validates the installed AVD and its RAM, launches the SDK emulator, binds to the console/ADB port assigned for that launch, waits for that exact transport and Android boot, then slims it. If the AVD already has a verified applied profile, it makes no duplicate guest changes. `--no-slim` waits through boot and returns without guest mutation; `--timings` reports startup phases and composes with `--no-slim`. Use `--ram=N` to override configured RAM. `--cold-boot` bypasses Quick Boot for that launch (`-no-snapshot`); it does not wipe data or delete snapshot files.
+## What slimming changes
+
+Slimming disables selected installed packages; it does not delete system packages. It also applies these settings:
+
+| Group | Change |
+| --- | --- |
+| `animations` | Set window, transition, and animator animation scales to zero. |
+| `bglimit` | Set background process limit and maximum cached processes to 4. |
+| `sync` | Disable global automatic sync. |
+| `location` | Disable location mode. |
+| `setup` | Mark user setup and device provisioning complete. |
+| `bluetooth` | Disable Bluetooth and, when present, the non-critical MIDI Bluetooth package. The protected boot-critical Google Bluetooth package is preserved. |
+
+The standard package profile covers Google apps, media, communication, accessibility extras, printing, wallpapers and dreams, and other emulator/user-facing packages. Only applicable installed packages are disabled; not every image contains every package. Previously disabled packages are protected, and restore re-enables only packages recorded as enabled before EmuTrim changed them.
+
+Customize `slim` with repeatable options:
+
+- `--skip=<group>` skips a settings/profile group. Groups: `animations`, `bglimit`, `sync`, `location`, `setup`, `bluetooth`. Combine groups with commas, for example `--skip=animations,location`; repeat the option if preferred.
+- `--keep=PACKAGE` prevents a package from being disabled. Repeat for multiple packages.
+- `--dry-run` prints planned package disables without changing the guest.
+
+## Commands
+
+| Command | Behavior and important options |
+| --- | --- |
+| `doctor [AVD] [--serial=SERIAL]` | Diagnose SDK, emulator, ADB, installed AVDs, image/config/RAM, optional target, and saved state. `--managed` selects managed assets. |
+| `list-avds` | List installed AVDs; add `--managed` for the managed environment. |
+| `start <AVD>` | Launch, wait for exact ADB transport and Android boot, then slim. Options: `--managed`, `--cold-boot` (bypass Quick Boot for this launch), `--no-slim`, `--timings`, `--ram=N`. |
+| `slim [SERIAL]` | Apply the reversible profile. Supports `--dry-run`, `--keep=PACKAGE`, and `--skip=GROUP`. |
+| `off [SERIAL]` | Alias for `restore`; restore recorded original state. |
+| `restore [SERIAL]` | Restore recorded package and setting state; retry incomplete restores safely. |
+| `watch [--serial=SERIAL]` | Watch ADB device events and slim eligible emulator connections; `--dry-run` reports without mutation. |
+| `stats <SERIAL> [--seconds=N]` | Read Windows process working set, private memory, CPU, threads, and handles. Unsupported on macOS. |
+| `tune-avd [AVD] [--managed] [--ram=N]` | Update AVD RAM/GPU settings after backing up `config.ini`; omitting AVD works only when exactly one is installed in selected environment. |
+| `managed root` | Print EmuTrim data root. |
+| `managed status` | Report isolated managed SDK/AVD setup. |
+| `managed setup` | Set up managed Android assets; currently supported on Apple Silicon macOS. |
+| `managed clean [--yes]` | Preview managed cleanup; `--yes` deletes managed payloads. |
+
+`off` and `restore` accept an optional serial; without one, EmuTrim selects the sole running emulator and refuses ambiguity. `--ram=N` is in MB. `--cold-boot` does not wipe data or delete snapshots. `--timings` reports startup phases.
+
+## Managed Android environment
+
+By default, EmuTrim stores its root at `~/.emutrim`; managed SDK and AVD payloads live under `~/.emutrim/managed`. Set `EMUTRIM_HOME` to use another EmuTrim-owned root. The managed environment isolates disposable SDK, system image, and AVD assets from Android Studio's SDK and external AVDs, making cleanup straightforward.
 
 ```sh
-emutrim doctor My_AVD [--serial=emulator-5556]
-emutrim start My_AVD --cold-boot
-emutrim start My_AVD --no-slim --timings
-emutrim stats emulator-5556 [--seconds=10]
-emutrim slim emulator-5556 --dry-run
-emutrim restore emulator-5556
-emutrim watch --serial=emulator-5556
-emutrim list-avds
-emutrim doctor --managed
-emutrim list-avds --managed
-emutrim start My_AVD --managed --no-slim --timings
-emutrim tune-avd My_AVD --managed
-emutrim managed root
-emutrim managed status
 emutrim managed setup
+emutrim managed status
 emutrim managed clean
 emutrim managed clean --yes
 ```
 
-`--managed` selects EmuTrim's isolated SDK/AVD environment for `doctor`, `list-avds`, `start`, and `tune-avd`. `doctor` is read-only. It checks SDK/emulator availability, ADB reachability, installed AVDs, selected image/config/RAM, and an optional running target and saved state. It exits nonzero on material failures; warnings alone succeed. `stats` reports Windows emulator process working set, private memory, CPU time/delta, threads, and handles. It is unsupported on macOS. Sampling is read-only.
+`managed clean --yes` deletes only EmuTrim-owned managed payloads. It does not delete the user's Android Studio SDK or external AVDs. Cleanup refuses to run while a managed emulator is running.
 
-If startup times out, EmuTrim reports the transport/boot phase and leaves the guest unchanged. It does not restart the emulator, wipe data, or delete snapshots. If an AVD remains offline during Quick Boot, retry with `emutrim start <AVD> --cold-boot`; this bypasses Quick Boot for one launch without deleting snapshots or wiping data.
+## Safety model
 
-## Safety and implementation
+When EmuTrim cannot prove that a target or saved state is safe, it refuses to mutate it rather than guessing. This is its fail-closed behavior.
 
-- Runtime ADB uses direct smart-socket TCP to `127.0.0.1:5037`, including shell-v2 where command status matters. EmuTrim does not spawn `adb.exe` or use `avdslim` at runtime.
-- Slim and restore require an `emulator-*` serial, positive `ro.kernel.qemu=1` identity, and `sys.boot_completed=1`. Physical and unresolved targets are never mutated.
-- Before mutation, EmuTrim persists and reads back the intended reversible state. Restore uses recorded originals only, checkpoints completed reversals, and is safe to retry. Missing state is a no-op; malformed/unreadable state fails closed.
-- The native standard profile protects boot-critical packages. A new plan refuses planned packages already disabled outside EmuTrim's state.
-- AVD RAM validation enforces 4096 MB minimum for detected 16 KB images and refuses values outside 1536–8192 MB. `tune-avd` backs up `config.ini` before changing RAM/GPU keys.
-- Integrated `start` verifies that the selected console port belongs to the process it launched before guest mutation. Port selection is bounded to Android Emulator's supported console range. Other online emulators do not redirect it.
-- Watch is event-driven (`host:track-devices`) with bounded boot checks; no steady-state polling or async runtime.
+- Physical devices and unresolved targets are never mutated. Guest changes require an `emulator-*` serial, positive emulator identity, and completed Android boot.
+- EmuTrim targets the exact serial and, for integrated `start`, verifies the selected console port belongs to the launched process. Port selection stays within the supported console range.
+- Reversible state is saved and read back before mutation. Restore uses recorded originals only, checkpoints successful reversals, and can be retried. Missing state is a no-op; malformed/unreadable state is an error.
+- Packages disabled before EmuTrim are protected from overwrite. Boot-critical Google Bluetooth is protected.
+- RAM validation enforces 4096 MB minimum for detected 16 KB images and rejects values outside 1536–8192 MB. `tune-avd` preserves a `config.ini` backup.
+- Runtime ADB connects directly to `127.0.0.1:5037` using the smart socket; guest operations do not spawn `adb`. EmuTrim has no runtime avdslim dependency.
+- `watch` uses event-driven ADB tracking with bounded boot checks.
 
-## Live-tested images
+## Supported platforms
 
-These are specific disposable AVDs, not broad Android-version support claims.
+- **Windows x86_64:** supported and live qualified.
+- **macOS Apple Silicon (arm64):** supported and live qualified; `stats` is unavailable.
+- **Linux:** CI/core code only; runtime support is not claimed.
+- Intel Mac runtime support is not claimed.
 
-| Image | Page size | RAM | Slim | Restore | Reconnect |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Android 17 / API 37.2 Google APIs x86_64 | 16 KB | 4096 MB | 49 packages | exact package/settings restore; repeat no-op | live tested |
-| Android 12 / API 31 Android TV x86 | 4 KB | 1536 MB | 5 packages | exact package/settings restore; repeat no-op | not tested |
+Live tests used specific disposable images, not broad Android-version qualification:
 
-The Android 12 image has TV-specific packages and lacks `com.google.android.bluetooth`; package counts differ by image.
+| Image | Page size | RAM | Slim/restore |
+| --- | ---: | ---: | --- |
+| Android 17 / API 37.2 Google APIs x86_64 | 16 KB | 4096 MB | 49 packages; exact package/settings restore; repeat no-op |
+| Android 12 / API 31 Android TV x86 | 4 KB | 1536 MB | 5 packages; exact package/settings restore; repeat no-op |
 
-The following resource measurements are Windows x86_64 only: API 37 measurements used disposable `EmuTrim_API37_FreshControl_20260926`, Emulator 37.2.7.0 (package metadata references `android-sdk-preview-license`), Platform-Tools 37.0.1, ADB server protocol 41, WHPX, image revision 5, 16 KB, and 4096 MB. In three cold-start resource cycles, stock/slim order was AB, BA, AB; each state stabilized for 120 seconds and had five 10-second samples. Statistics are for the console-owner QEMU process. Working Set is its resident working set; `PrivateUsage` is committed private memory, not physical RAM. Pooled median Working Set was 4772.7 MB stock vs 4788.0 MB slim (+15.3 MB); PrivateUsage was 5630.2 vs 5631.8 MB (+1.6 MB); CPU was 2.266 vs 1.984 seconds per 10-second sample (−0.282s). Median within-cycle CPU delta was −0.328s/10s; Working Set and private-memory results did not show savings. These idle measurements do not establish application performance and are not macOS measurements.
+Package counts vary by image and architecture. Android 12 TV image lacks `com.google.android.bluetooth`.
+Apple Silicon macOS managed AVD setup and isolation have also been live-qualified; no package-count comparison is claimed.
 
-Windows x86_64 cold-start comparison: stable Emulator 37.1.11.0 build 15917651 and preview-license Emulator 37.2.7.0 build 16195039 alternated on the same API 37 AVD and host, three starts per build. Total launch-to-boot times were 26.07, 24.63, 24.78s (stable; median 24.78, range 24.63–26.07) and 22.82, 22.62, 22.56s (preview; median 22.62, range 22.56–22.82). This small, single-host sample does not establish a general version advantage or root cause. EmuTrim `start --timings` reports launch, authenticated console, ADB transport, device, boot-complete, and ready-decision phases only when requested. One API 31 Windows integrated-start acceptance completed in 6.0s; an API 37 Windows integrated start remained offline through its existing 120-second transport bound. No general startup-time claim is made.
+## Benchmarks
 
-## Tests and local build
+The measured Windows configuration did not show RAM savings. It showed a modest lower idle CPU signal in the tested setup. These results are not a general performance claim. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology, full results, and qualifications. No macOS benchmark is claimed.
 
-```powershell
+## Build and test
+
+```sh
 cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-Tests use a scripted local ADB smart-socket server and temporary configs; they do not require a real emulator or modify user AVDs. Real mutation checks use only disposable AVDs.
+Tests use a scripted local ADB smart-socket server and temporary configs; they do not require a real emulator or modify user AVDs. Intentional real mutation checks use disposable AVDs.
+
+## License
+
+EmuTrim v0.5.0 and later is source-available under the MIT License with Commons Clause License Condition v1.0. You may use, modify, and redistribute it subject to those terms, but you may not sell EmuTrim itself or a product/service whose value derives entirely or substantially from EmuTrim. See [LICENSE](LICENSE) for the full terms.
+
+EmuTrim v0.4.0 and earlier remain under the MIT License under which they were released. Those prior grants are unchanged.
+
+## Third-party notices
+
+Portions of the standard slimming profile package selection were derived/adapted from `kdbhalala/avdslim`. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and license text.
