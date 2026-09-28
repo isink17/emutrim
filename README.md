@@ -27,10 +27,10 @@ Install the latest source from the repository:
 cargo install --git https://github.com/isink17/emutrim emutrim
 ```
 
-For a reproducible version, install the release tag:
+For a reproducible version, install the current release tag:
 
 ```sh
-cargo install --git https://github.com/isink17/emutrim --tag v0.5.0 emutrim
+cargo install --git https://github.com/isink17/emutrim --tag v0.6.0 emutrim
 ```
 
 EmuTrim is not published on crates.io.
@@ -42,10 +42,12 @@ An ADB server must already be running at `127.0.0.1:5037`. Android Studio often 
 ```sh
 emutrim doctor
 emutrim list-avds
-emutrim start My_AVD
+emutrim start My_AVD --headless
+emutrim status emulator-5554
+emutrim stop My_AVD
 ```
 
-`start` slims by default after the exact emulator finishes booting. For a completely non-mutating first boot, use `emutrim start My_AVD --no-slim`.
+Use serial printed by `start` with `status`; example assumes `emulator-5554`. `start` applies reversible test-oriented profile after exact emulator boot. `--headless` adds Emulator `-no-window`; `--no-slim` skips guest changes.
 
 ## What slimming changes
 
@@ -89,6 +91,14 @@ Customize `slim` with repeatable options:
 | `managed clean [--yes]` | Preview managed cleanup; `--yes` deletes managed payloads. |
 
 `off` and `restore` accept an optional serial; without one, EmuTrim selects the sole running emulator and refuses ambiguity. `--ram=N` is in MB. `--cold-boot` does not wipe data or delete snapshots. `--timings` reports startup phases.
+
+## Inspect and stop
+
+`status SERIAL` requires an exact ADB serial and is read-only. It reports transport and identity, available guest properties, safely resolved AVD name, slim state, and managed/external/unknown ownership. Physical targets are inspectable; offline and unauthorized targets do not receive fabricated guest values. Unavailable JSON properties are `null`.
+
+`stop SERIAL` targets exact emulator serial. `stop AVD_NAME` requires one authenticated console reporting exact AVD name. Physical devices and ambiguous targets are refused. Shutdown does not require boot completion. Existing AVD without a running instance reports already stopped.
+
+Read-only JSON supports `doctor --json`, `status SERIAL --json`, and `list-avds --json`; add `--managed` where supported. Success envelope is `{"schema_version":1,"ok":true,"data":{}}`; failure envelope includes `ok:false` and an error code/message. Schema version 1 describes current fields; fields may evolve before 1.0. Mutating `start` and `stop` have no JSON mode.
 
 ## Managed Android environment
 
