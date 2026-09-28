@@ -16,11 +16,8 @@ pub fn run(args: Vec<String>) -> io::Result<()> {
     }
     let target = &args[0];
     let by_serial = avd::console_port(target).is_some();
-    if !by_serial
-        && adb::track::devices(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5037))?
-            .iter()
-            .any(|device| device.serial == *target)
-    {
+    let devices = adb::track::devices(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5037))?;
+    if known_physical_serial(target, by_serial, &devices) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -51,21 +48,16 @@ pub fn run(args: Vec<String>) -> io::Result<()> {
                     format!("cannot authenticate console on {port}: {error}"),
                 )
             })?;
-            if name == *target {
+            if same_avd_name(&name, target) {
                 verify_identity(port, &format!("emulator-{port}"))?;
                 matches.push((port, owner, name));
             }
         }
         matches
     };
-    let selected = match candidates.as_slice() {
-        [] if by_serial => {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{target} is not a running emulator"),
-            ))
-        }
-        [] => {
+    let selected = match select_candidate(candidates, by_serial, target)? {
+        Some(selected) => selected,
+        None => {
             if avd::config_path_mode(target, false).is_err()
                 && avd::config_path_mode(target, true).is_err()
             {
@@ -77,30 +69,70 @@ pub fn run(args: Vec<String>) -> io::Result<()> {
             println!("{target} is already stopped.");
             return Ok(());
         }
-        [one] => one.clone(),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                "multiple running emulators report AVD name {target:?}; refusing ambiguous stop"
-            ),
-            ))
-        }
     };
     let (port, _owner, name) = selected;
     avd::console::shutdown_until(port, Instant::now() + Duration::from_secs(3))?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if platform::console_owner_pid(port)?.is_none() {
-            println!("Stopped emulator-{port} ({name}).");
+    wait_until_closed(port, Instant::now() + Duration::from_secs(10), || {
+        platform::console_owner_pid(port)
+    })?;
+    println!("Stopped emulator-{port} ({name}).");
+    Ok(())
+}
+
+type Candidate = (u16, u32, String);
+
+fn known_physical_serial(
+    target: &str,
+    emulator_serial: bool,
+    devices: &[adb::track::DeviceState],
+) -> bool {
+    !emulator_serial && devices.iter().any(|device| device.serial == target)
+}
+
+fn same_avd_name(actual: &str, requested: &str) -> bool {
+    actual == requested
+}
+
+fn select_candidate(
+    candidates: Vec<Candidate>,
+    by_serial: bool,
+    target: &str,
+) -> io::Result<Option<Candidate>> {
+    match candidates.as_slice() {
+        [] if by_serial => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{target} is not a running emulator"),
+        )),
+        [] => Ok(None),
+        [one] => Ok(Some(one.clone())),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "multiple running emulators report AVD name {target:?}; refusing ambiguous stop"
+            ),
+        )),
+    }
+}
+
+fn wait_until_closed(
+    port: u16,
+    deadline: Instant,
+    mut owner: impl FnMut() -> io::Result<Option<u32>>,
+) -> io::Result<()> {
+    loop {
+        if owner()?.is_none() {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(100));
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("emulator-{port} console still owns port after shutdown timeout"),
+            ));
+        }
+        thread::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        format!("emulator-{port} ({name}) console still owns port after shutdown timeout"),
-    ))
 }
 
 fn verify_identity(port: u16, serial: &str) -> io::Result<()> {
@@ -137,4 +169,53 @@ fn verify_identity(port: u16, serial: &str) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_known_physical_device_serial() {
+        let devices = [adb::track::DeviceState {
+            serial: "R58M123456A".into(),
+            state: "device".into(),
+        }];
+        assert!(known_physical_serial("R58M123456A", false, &devices));
+        assert!(!known_physical_serial("emulator-5554", true, &devices));
+        assert!(!known_physical_serial("other", false, &devices));
+    }
+
+    #[test]
+    fn avd_match_is_exact_and_unique() {
+        assert!(same_avd_name("Pixel_9_API_36", "Pixel_9_API_36"));
+        assert!(!same_avd_name("Pixel_9_API_36_copy", "Pixel_9_API_36"));
+        let one = (5554, 12, "Pixel".to_owned());
+        assert_eq!(
+            select_candidate(vec![one.clone()], false, "Pixel").unwrap(),
+            Some(one.clone())
+        );
+        assert!(select_candidate(vec![], true, "emulator-5554").is_err());
+        assert!(select_candidate(vec![], false, "Pixel").unwrap().is_none());
+        assert!(select_candidate(
+            vec![one.clone(), (5556, 13, "Pixel".into())],
+            false,
+            "Pixel"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn shutdown_wait_requires_console_disappearance() {
+        let mut owners = [Some(12), None].into_iter();
+        wait_until_closed(5554, Instant::now() + Duration::from_secs(1), || {
+            Ok(owners.next().flatten())
+        })
+        .unwrap();
+        let error = wait_until_closed(5554, Instant::now() + Duration::from_millis(1), || {
+            Ok(Some(12))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
 }
