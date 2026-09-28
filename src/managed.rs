@@ -1310,6 +1310,17 @@ mod tests {
     }
 
     #[test]
+    fn owned_path_guard_rejects_avd_and_managed_parents() {
+        let layout = clear_fixture(&["Alpha"]);
+        for forbidden in [&layout.root, &layout.managed, &layout.sdk, &layout.avd] {
+            assert!(validate_owned_path(forbidden, &layout.avd, true).is_err());
+        }
+        let avd_root = layout.avd.canonicalize().unwrap();
+        assert!(validate_owned_path(&avd_root.join("Alpha.avd"), &avd_root, true).is_ok());
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
     fn deletion_failure_keeps_manifest_authoritative_and_retryable() {
         let layout = clear_fixture(&["Alpha", "Beta"]);
         let before = fs::read(&layout.manifest).unwrap();
