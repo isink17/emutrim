@@ -27,8 +27,8 @@ jobs:
           $version = "${{ github.ref_name }}" -replace '^v', ''
           $name = "emutrim-v$version-windows-x86_64"
           New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Copy-Item target/release/emutrim.exe, README.md, LICENSE -Destination dist
-          Compress-Archive -Path dist/emutrim.exe, dist/README.md, dist/LICENSE -DestinationPath "$name.zip"
+          Copy-Item target/release/emutrim.exe, README.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination dist
+          Compress-Archive -Path dist/emutrim.exe, dist/README.md, dist/LICENSE, dist/THIRD_PARTY_NOTICES.md -DestinationPath "$name.zip"
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $name.zip" | Set-Content "$name.zip.sha256"
       - uses: actions/upload-artifact@v4
@@ -53,8 +53,8 @@ jobs:
         run: |
           name="emutrim-${GITHUB_REF_NAME}-macos-arm64"
           mkdir dist
-          cp target/release/emutrim README.md LICENSE dist/
-          tar -czf "$name.tar.gz" -C dist emutrim README.md LICENSE
+          cp target/release/emutrim README.md LICENSE THIRD_PARTY_NOTICES.md dist/
+          tar -czf "$name.tar.gz" -C dist emutrim README.md LICENSE THIRD_PARTY_NOTICES.md
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
@@ -78,6 +78,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cat > release-notes.md <<'EOF'
+          EmuTrim 0.5.0
+
+          - Improved README onboarding and command documentation, including slimming behavior.
+          - Added third-party notices and release packaging.
+          - Repository guidance now requires the personal GitHub noreply identity for commits.
+          - Licensing change: v0.5.0 and later is source-available under MIT with Commons Clause License Condition v1.0. v0.4.0 and earlier remain MIT.
+
+          Platforms: Windows x86_64 and Apple Silicon macOS (arm64). macOS stats is not supported. Linux remains CI/core-only.
+          EOF
           gh release create "${GITHUB_REF_NAME}" dist/* \
             --title "EmuTrim ${GITHUB_REF_NAME#v}" \
-            --notes "Apple Silicon macOS support; isolated managed Android environments and safe managed cleanup; verified macOS launch identity; existing Windows support. macOS stats is not yet supported. Linux remains CI/core-only."
+            --notes-file release-notes.md
