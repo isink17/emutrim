@@ -76,6 +76,15 @@ pub fn avd_name(port: u16) -> io::Result<String> {
 }
 
 pub fn avd_name_until(port: u16, deadline: Instant) -> io::Result<String> {
+    parse_avd_name(command_until(port, "avd name", deadline)?)
+}
+
+pub fn shutdown_until(port: u16, deadline: Instant) -> io::Result<()> {
+    let _ = command_until(port, "kill", deadline)?;
+    Ok(())
+}
+
+fn command_until(port: u16, command: &str, deadline: Instant) -> io::Result<Vec<String>> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let stream = TcpStream::connect_timeout(&address, remaining(deadline)?)?;
     stream.set_read_timeout(Some(remaining(deadline)?))?;
@@ -103,8 +112,8 @@ pub fn avd_name_until(port: u16, deadline: Instant) -> io::Result<String> {
     reader
         .get_mut()
         .set_write_timeout(Some(remaining(deadline)?))?;
-    writeln!(reader.get_mut(), "avd name")?;
-    parse_avd_name(response(&mut reader, deadline)?)
+    writeln!(reader.get_mut(), "{command}")?;
+    response(&mut reader, deadline)
 }
 
 #[cfg(test)]

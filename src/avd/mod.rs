@@ -357,6 +357,7 @@ pub fn start_mode(
     ram: u32,
     port: u16,
     cold_boot: bool,
+    headless: bool,
     managed: bool,
 ) -> io::Result<Child> {
     let info = inspect_mode(name, managed)?;
@@ -393,15 +394,23 @@ pub fn start_mode(
             .env("ANDROID_EMULATOR_HOME", layout.tmp.join("emulator-home"))
             .env("TMPDIR", &layout.tmp);
     }
-    command.arg("-memory").arg(ram.to_string());
-    if cold_boot {
-        command.arg("-no-snapshot");
-    }
+    command.args(launch_args(ram, cold_boot, headless, info.is_16k));
     command.stdout(Stdio::null()).stderr(Stdio::null());
-    if !info.is_16k {
-        command.arg("-lowram");
-    }
     command.spawn()
+}
+
+fn launch_args(ram: u32, cold_boot: bool, headless: bool, is_16k: bool) -> Vec<String> {
+    let mut args = vec!["-memory".into(), ram.to_string()];
+    if cold_boot {
+        args.push("-no-snapshot".into());
+    }
+    if headless {
+        args.push("-no-window".into());
+    }
+    if !is_16k {
+        args.push("-lowram".into());
+    }
+    args
 }
 #[cfg(test)]
 mod tests {
@@ -482,6 +491,20 @@ mod tests {
         assert_eq!(console_port("emulator-5556"), Some(5556));
         assert_eq!(console_port("emulator-5557"), None);
         assert_eq!(console_port("0123ABC"), None);
+    }
+
+    #[test]
+    fn headless_only_adds_no_window_and_composes_with_start_options() {
+        let normal = launch_args(2048, false, false, false);
+        assert!(!normal.contains(&"-no-window".into()));
+        let headless = launch_args(2048, true, true, false);
+        assert_eq!(
+            headless.iter().filter(|arg| *arg == "-no-window").count(),
+            1
+        );
+        assert!(headless.contains(&"-no-snapshot".into()));
+        assert!(headless.contains(&"-lowram".into()));
+        assert!(!launch_args(4096, false, true, true).contains(&"-lowram".into()));
     }
 
     #[test]

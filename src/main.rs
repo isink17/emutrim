@@ -1,7 +1,9 @@
 mod adb;
 mod avd;
 mod cli;
+mod commands;
 mod managed;
+mod output;
 mod platform;
 mod slim;
 
@@ -79,18 +81,61 @@ fn run() -> io::Result<()> {
         "tune-avd" => tune(args),
         "managed" => managed::run(args),
         "start" => start(args),
+        "status" => {
+            if args.iter().any(|arg| arg == "--json") {
+                commands::status::print_json_result(
+                    &args
+                        .into_iter()
+                        .filter(|arg| arg != "--json")
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                commands::status::run(args)
+            }
+        }
+        "stop" => commands::stop::run(args),
         "doctor" => doctor(args),
         "stats" => stats(args),
         "list-avds" => {
             let managed = args.iter().any(|arg| arg == "--managed");
-            if args.iter().any(|arg| arg != "--managed") {
-                return Err(io::Error::new(
+            let json = args.iter().any(|arg| arg == "--json");
+            if args.iter().any(|arg| arg != "--managed" && arg != "--json") {
+                let error = io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "usage: list-avds [--managed]",
-                ));
+                    "usage: list-avds [--managed] [--json]",
+                );
+                if json {
+                    output::failure("invalid_arguments", &error.to_string());
+                }
+                return Err(error);
             }
-            for name in avd::list_mode(managed)? {
-                println!("{name}");
+            let names = match avd::list_mode(managed) {
+                Ok(names) => names,
+                Err(error) if json => {
+                    output::failure(output::code_for(&error), &error.to_string());
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+            if json {
+                #[derive(serde::Serialize)]
+                struct Avd {
+                    name: String,
+                    ownership: String,
+                }
+                output::success(
+                    names
+                        .into_iter()
+                        .map(|name| Avd {
+                            ownership: commands::status::ownership(&name),
+                            name,
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            } else {
+                for name in names {
+                    println!("{name}");
+                }
             }
             Ok(())
         }
@@ -246,7 +291,7 @@ fn tune(args: Vec<String>) -> io::Result<()> {
 fn start(args: Vec<String>) -> io::Result<()> {
     let managed = args.iter().any(|arg| arg == "--managed");
     let args: Vec<String> = args.into_iter().filter(|arg| arg != "--managed").collect();
-    let (name, requested_ram, no_slim, timings, cold_boot) = start_args(args)?;
+    let (name, requested_ram, no_slim, timings, cold_boot, headless) = start_args(args)?;
     let info = avd::inspect_mode(&name, managed)?;
     let ram = requested_ram.unwrap_or(info.ram_mb);
     avd::validate_ram(&info, ram)?;
@@ -267,7 +312,7 @@ fn start(args: Vec<String>) -> io::Result<()> {
     }
     let port = avd::available_console_port()?;
     let serial = format!("emulator-{port}");
-    let mut child = avd::start_mode(&name, ram, port, cold_boot, managed)?;
+    let mut child = avd::start_mode(&name, ram, port, cold_boot, headless, managed)?;
     let mut timing = StartupTiming {
         capture: timings,
         launched: Some(Instant::now()),
@@ -469,12 +514,13 @@ fn slim_after_boot(addr: SocketAddr, serial: &str) -> io::Result<SlimResult> {
     }
 }
 
-fn start_args(args: Vec<String>) -> io::Result<(String, Option<u32>, bool, bool, bool)> {
+fn start_args(args: Vec<String>) -> io::Result<(String, Option<u32>, bool, bool, bool, bool)> {
     let mut name = None;
     let mut ram = None;
     let mut no_slim = false;
     let mut timings = false;
     let mut cold_boot = false;
+    let mut headless = false;
     for arg in args {
         if arg == "--no-slim" {
             no_slim = true;
@@ -482,6 +528,8 @@ fn start_args(args: Vec<String>) -> io::Result<(String, Option<u32>, bool, bool,
             timings = true;
         } else if arg == "--cold-boot" {
             cold_boot = true;
+        } else if arg == "--headless" {
+            headless = true;
         } else if let Some(value) = arg.strip_prefix("--ram=") {
             if ram.is_some() {
                 return Err(io::Error::new(
@@ -515,6 +563,7 @@ fn start_args(args: Vec<String>) -> io::Result<(String, Option<u32>, bool, bool,
         no_slim,
         timings,
         cold_boot,
+        headless,
     ))
 }
 
@@ -524,30 +573,33 @@ fn default_adb_addr() -> SocketAddr {
 
 fn doctor(args: Vec<String>) -> io::Result<()> {
     let managed = args.iter().any(|arg| arg == "--managed");
-    let args: Vec<String> = args.into_iter().filter(|arg| arg != "--managed").collect();
+    let json = args.iter().any(|arg| arg == "--json");
+    output::begin_doctor_json(json);
+    let args: Vec<String> = args
+        .into_iter()
+        .filter(|arg| arg != "--managed" && arg != "--json")
+        .collect();
     let mut selected_avd = None;
     let mut selected_serial = None;
     for arg in args {
         if let Some(serial) = arg.strip_prefix("--serial=") {
             if serial.is_empty() || selected_serial.replace(serial.to_owned()).is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid --serial",
-                ));
+                let error = io::Error::new(io::ErrorKind::InvalidInput, "invalid --serial");
+                return doctor_arg_error(json, error);
             }
         } else if !arg.starts_with('-') {
             if selected_avd.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "pass at most one AVD name",
-                ));
+                let error =
+                    io::Error::new(io::ErrorKind::InvalidInput, "pass at most one AVD name");
+                return doctor_arg_error(json, error);
             }
             selected_avd = Some(arg);
         } else {
-            return Err(io::Error::new(
+            let error = io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("invalid doctor argument: {arg}"),
-            ));
+            );
+            return doctor_arg_error(json, error);
         }
     }
 
@@ -728,7 +780,26 @@ fn doctor(args: Vec<String>) -> io::Result<()> {
             None => report_check("FAIL", "target checks skipped: ADB server unavailable"),
         }
     }
-    doctor_exit(failures)
+    if json {
+        let report = output::finish_doctor_json(failures);
+        if failures == 0 {
+            output::success(report);
+            Ok(())
+        } else {
+            let message = format!("doctor found {failures} material failure(s)");
+            output::failure_with_data("doctor_failed", &message, report);
+            doctor_exit(failures)
+        }
+    } else {
+        doctor_exit(failures)
+    }
+}
+
+fn doctor_arg_error(json: bool, error: io::Error) -> io::Result<()> {
+    if json {
+        output::failure("invalid_arguments", &error.to_string());
+    }
+    Err(error)
 }
 
 fn doctor_exit(failures: usize) -> io::Result<()> {
@@ -753,7 +824,9 @@ fn emulator_uses_preview_license(metadata: &str) -> bool {
 }
 
 fn report_check(status: &str, message: &str) {
-    println!("{status} {message}");
+    if !output::report_doctor_check(status, message) {
+        println!("{status} {message}");
+    }
 }
 
 fn inspect_running_target(
@@ -1657,19 +1730,19 @@ mod start_tests {
     fn start_defaults_ram_to_avd_config_and_accepts_no_slim() {
         assert_eq!(
             start_args(vec!["Test_AVD".into(), "--no-slim".into()]).unwrap(),
-            ("Test_AVD".into(), None, true, false, false)
+            ("Test_AVD".into(), None, true, false, false, false)
         );
         assert_eq!(
             start_args(vec!["Test_AVD".into(), "--ram=4096".into()]).unwrap(),
-            ("Test_AVD".into(), Some(4096), false, false, false)
+            ("Test_AVD".into(), Some(4096), false, false, false, false)
         );
         assert_eq!(
             start_args(vec!["Test_AVD".into(), "--timings".into()]).unwrap(),
-            ("Test_AVD".into(), None, false, true, false)
+            ("Test_AVD".into(), None, false, true, false, false)
         );
         assert_eq!(
             start_args(vec!["Test_AVD".into(), "--cold-boot".into()]).unwrap(),
-            ("Test_AVD".into(), None, false, false, true)
+            ("Test_AVD".into(), None, false, false, true, false)
         );
         assert!(start_args(vec!["Test_AVD".into(), "Other".into()]).is_err());
     }

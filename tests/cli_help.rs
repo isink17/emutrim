@@ -12,8 +12,10 @@ fn emutrim(args: &[&str]) -> std::process::Output {
 #[test]
 fn command_help_succeeds_and_describes_supported_syntax() {
     for (args, expected) in [
-        (&["start", "--help"][..], "--cold-boot"),
-        (&["doctor", "--help"], "--serial=SERIAL"),
+        (&["start", "--help"][..], "--headless"),
+        (&["doctor", "--help"], "--json"),
+        (&["status", "--help"], "<SERIAL>"),
+        (&["stop", "--help"], "<SERIAL|AVD>"),
         (&["slim", "--help"], "--dry-run"),
         (&["restore", "--help"], "off is an alias"),
         (&["watch", "--help"], "--skip=GROUP"),
@@ -32,6 +34,21 @@ fn command_help_succeeds_and_describes_supported_syntax() {
         let output = emutrim(args);
         assert!(output.status.success(), "{args:?}: {:?}", output.stderr);
         assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+    }
+}
+
+#[test]
+fn json_argument_errors_are_single_valid_documents_and_nonzero() {
+    for args in [
+        &["doctor", "--json", "--unknown"][..],
+        &["list-avds", "--json", "--unknown"][..],
+    ] {
+        let output = emutrim(args);
+        assert!(!output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["ok"], false);
+        assert!(value["error"]["code"].is_string());
     }
 }
 
