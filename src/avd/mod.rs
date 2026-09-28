@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 pub mod console;
@@ -19,6 +19,13 @@ pub struct AvdInfo {
     pub gpu_mode: String,
     pub gpu_enabled: String,
     pub backup_exists: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotMode {
+    Normal,
+    ColdBoot,
+    Reset,
 }
 
 pub fn sdk_dir() -> io::Result<PathBuf> {
@@ -356,7 +363,7 @@ pub fn start_mode(
     name: &str,
     ram: u32,
     port: u16,
-    cold_boot: bool,
+    snapshot: SnapshotMode,
     headless: bool,
     managed: bool,
 ) -> io::Result<Child> {
@@ -380,12 +387,24 @@ pub fn start_mode(
         ));
     }
     let mut command = Command::new(emulator);
-    command.args(["-avd", name, "-port", &port.to_string(), "-gpu", "host"]);
-    if managed {
-        let layout = crate::managed::Layout::resolve()?;
-        command
-            .arg("-datadir")
-            .arg(layout.avd.join(format!("{name}.avd")));
+    let layout = if managed {
+        Some(crate::managed::Layout::resolve()?)
+    } else {
+        None
+    };
+    let datadir = layout
+        .as_ref()
+        .map(|layout| layout.avd.join(format!("{name}.avd")));
+    command.args(launch_args(
+        name,
+        port,
+        datadir.as_deref(),
+        ram,
+        snapshot,
+        headless,
+        info.is_16k,
+    ));
+    if let Some(layout) = layout {
         command
             .env("ANDROID_HOME", &sdk)
             .env("ANDROID_SDK_ROOT", &sdk)
@@ -394,15 +413,36 @@ pub fn start_mode(
             .env("ANDROID_EMULATOR_HOME", layout.tmp.join("emulator-home"))
             .env("TMPDIR", &layout.tmp);
     }
-    command.args(launch_args(ram, cold_boot, headless, info.is_16k));
     command.stdout(Stdio::null()).stderr(Stdio::null());
     command.spawn()
 }
 
-fn launch_args(ram: u32, cold_boot: bool, headless: bool, is_16k: bool) -> Vec<String> {
-    let mut args = vec!["-memory".into(), ram.to_string()];
-    if cold_boot {
-        args.push("-no-snapshot".into());
+fn launch_args(
+    name: &str,
+    port: u16,
+    datadir: Option<&Path>,
+    ram: u32,
+    snapshot: SnapshotMode,
+    headless: bool,
+    is_16k: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "-avd".into(),
+        name.into(),
+        "-port".into(),
+        port.to_string(),
+        "-gpu".into(),
+        "host".into(),
+    ];
+    if let Some(datadir) = datadir {
+        args.push("-datadir".into());
+        args.push(datadir.to_string_lossy().into_owned());
+    }
+    args.extend(["-memory".into(), ram.to_string()]);
+    match snapshot {
+        SnapshotMode::Normal => {}
+        SnapshotMode::ColdBoot => args.push("-no-snapshot".into()),
+        SnapshotMode::Reset => args.extend(["-wipe-data".into(), "-no-snapshot-load".into()]),
     }
     if headless {
         args.push("-no-window".into());
@@ -495,16 +535,73 @@ mod tests {
 
     #[test]
     fn headless_only_adds_no_window_and_composes_with_start_options() {
-        let normal = launch_args(2048, false, false, false);
+        let normal = launch_args(
+            "Alpha",
+            5554,
+            None,
+            2048,
+            SnapshotMode::Normal,
+            false,
+            false,
+        );
         assert!(!normal.contains(&"-no-window".into()));
-        let headless = launch_args(2048, true, true, false);
+        let headless = launch_args(
+            "Alpha",
+            5554,
+            None,
+            2048,
+            SnapshotMode::ColdBoot,
+            true,
+            false,
+        );
         assert_eq!(
             headless.iter().filter(|arg| *arg == "-no-window").count(),
             1
         );
         assert!(headless.contains(&"-no-snapshot".into()));
         assert!(headless.contains(&"-lowram".into()));
-        assert!(!launch_args(4096, false, true, true).contains(&"-lowram".into()));
+        assert!(
+            !launch_args("Alpha", 5554, None, 4096, SnapshotMode::Normal, true, true)
+                .contains(&"-lowram".into())
+        );
+    }
+
+    #[test]
+    fn reset_args_wipe_data_and_cold_boot_without_disabling_snapshot_save() {
+        let datadir = PathBuf::from("/managed/avd/Alpha.avd");
+        let args = launch_args(
+            "Alpha",
+            5556,
+            Some(&datadir),
+            4096,
+            SnapshotMode::Reset,
+            false,
+            true,
+        );
+        assert_eq!(
+            args[..10],
+            [
+                "-avd",
+                "Alpha",
+                "-port",
+                "5556",
+                "-gpu",
+                "host",
+                "-datadir",
+                "/managed/avd/Alpha.avd",
+                "-memory",
+                "4096"
+            ]
+        );
+        assert_eq!(args.iter().filter(|arg| *arg == "-wipe-data").count(), 1);
+        assert_eq!(
+            args.iter()
+                .filter(|arg| *arg == "-no-snapshot-load")
+                .count(),
+            1
+        );
+        assert!(!args.contains(&"-no-snapshot".into()));
+        assert!(!args.contains(&"-no-window".into()));
     }
 
     #[test]

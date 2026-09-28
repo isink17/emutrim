@@ -90,6 +90,7 @@ Customize `slim` with repeatable options:
 | `managed setup` | Set up managed Android assets; currently supported on Apple Silicon macOS. |
 | `managed clean [--yes]` | Preview managed cleanup; `--yes` deletes managed payloads. |
 | `clear [AVD_NAME|all] [--yes]` | Preview or remove only positively identified EmuTrim-managed AVD definitions and their mutable files. |
+| `reset <AVD_NAME> [--yes]` | Preview or factory-reset guest userdata of one positively identified managed AVD; retains AVD and SD-card image. |
 
 `off` and `restore` accept an optional serial; without one, EmuTrim selects the sole running emulator and refuses ambiguity. `--ram=N` is in MB. `--cold-boot` does not wipe data or delete snapshots. `--timings` reports startup phases.
 
@@ -111,6 +112,8 @@ emutrim managed status
 emutrim start My_AVD --managed
 emutrim status emulator-5554
 emutrim stop My_AVD
+emutrim reset My_AVD
+emutrim reset My_AVD --yes
 emutrim clear My_AVD
 emutrim clear My_AVD --yes
 emutrim clear all
@@ -123,6 +126,8 @@ emutrim managed clean --yes
 `clear` removes one or all EmuTrim-managed AVDs only; `managed clean` removes the full EmuTrim-managed Android environment. `clear AVD_NAME` and `clear all` validate and print a dry-run plan; add `--yes` to delete. Bare `clear` opens an interactive managed-AVD selector and confirmation, and refuses when stdin or stdout is not a terminal. `clear` removes only manifest-identified EmuTrim AVD definitions (`.ini`) and each AVD's mutable `.avd` directory. External AVDs are unsupported and left untouched. Running AVDs and uncertain console authentication are refused; stop explicitly before clearing. `clear all --yes` preflights every target before deleting any AVD.
 
 `managed clean --yes` has broader scope: it deletes the full EmuTrim-managed payload, including managed SDK and system images. `clear all --yes` preserves that environment so setup remains reusable.
+
+`start` launches an AVD and applies EmuTrim's reversible profile; `stop` stops its runtime. `reset AVD_NAME` is managed-only and dry-run by default. `reset AVD_NAME --yes` uses Emulator `-wipe-data -no-snapshot-load`, waits for verified boot, verifies EmuTrim guest state is absent, then stops the exact emulator. It preserves the AVD definition, managed SDK/system image, and `sdcard.img`; it resets guest userdata, not all storage. Running AVDs must be stopped first. A pending reset blocks `start`, `slim`, `restore`/`off`, `watch`, and `clear` for that AVD until reset is retried with `--yes`. `clear` deletes the managed AVD definition and mutable directory; `managed clean --yes` deletes the full managed environment.
 
 ## Safety model
 

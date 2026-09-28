@@ -5,6 +5,8 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+pub(crate) mod reset;
+
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub root: PathBuf,
@@ -241,6 +243,45 @@ impl ClearOps for SystemClearOps {
 }
 
 pub(crate) fn plan_clear(layout: &Layout, requested: Option<&str>) -> io::Result<ClearPlan> {
+    let manifest = read_manifest(layout)?;
+    let mut targets = resolve_managed_avds(layout, &manifest)?;
+    if let Some(name) = requested {
+        let Some(target) = targets.iter().find(|target| target.name == name).cloned() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("managed AVD {name:?} not found"),
+            ));
+        };
+        targets = vec![target];
+    }
+    if requested.is_none() {
+        reset::refuse_if_any_pending(layout)?;
+    } else {
+        for target in &targets {
+            reset::refuse_if_pending(layout, target)?;
+        }
+    }
+    Ok(ClearPlan {
+        layout: layout.clone(),
+        manifest,
+        targets,
+    })
+}
+
+pub(crate) fn resolve_managed_avd(layout: &Layout, name: &str) -> io::Result<ClearTarget> {
+    let manifest = read_manifest(layout)?;
+    resolve_managed_avds(layout, &manifest)?
+        .into_iter()
+        .find(|target| target.name == name)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("managed AVD {name:?} not found"),
+            )
+        })
+}
+
+fn read_manifest(layout: &Layout) -> io::Result<serde_json::Value> {
     validate_manifest_file(layout)?;
     let data = fs::read(&layout.manifest)?;
     let mut manifest: serde_json::Value =
@@ -251,28 +292,25 @@ pub(crate) fn plan_clear(layout: &Layout, requested: Option<&str>) -> io::Result
     if object.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
         return Err(invalid_manifest("unsupported managed manifest schema"));
     }
-    let names = object
+    if object
         .get("avds")
         .and_then(serde_json::Value::as_array)
+        .is_none()
+    {
+        return Err(invalid_manifest("manifest avds must be an array"));
+    }
+    Ok(manifest)
+}
+
+fn resolve_managed_avds(
+    layout: &Layout,
+    manifest: &serde_json::Value,
+) -> io::Result<Vec<ClearTarget>> {
+    let names = manifest["avds"]
+        .as_array()
         .ok_or_else(|| invalid_manifest("manifest avds must be an array"))?;
     if names.is_empty() {
-        if let Some(name) = requested {
-            if !safe_avd_name(name) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid managed AVD name",
-                ));
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("managed AVD {name:?} not found"),
-            ));
-        }
-        return Ok(ClearPlan {
-            layout: layout.clone(),
-            manifest,
-            targets: Vec::new(),
-        });
+        return Ok(Vec::new());
     }
     let mut seen = std::collections::HashSet::new();
     let avd_root = canonical_avd_root(layout)?;
@@ -333,28 +371,7 @@ pub(crate) fn plan_clear(layout: &Layout, requested: Option<&str>) -> io::Result
             ini,
         });
     }
-    let selected = if let Some(name) = requested {
-        if !safe_avd_name(name) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid managed AVD name",
-            ));
-        }
-        let Some(target) = targets.iter().find(|target| target.name == name).cloned() else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("managed AVD {name:?} not found"),
-            ));
-        };
-        vec![target]
-    } else {
-        targets
-    };
-    Ok(ClearPlan {
-        layout: layout.clone(),
-        manifest,
-        targets: selected,
-    })
+    Ok(targets)
 }
 
 fn validate_manifest_file(layout: &Layout) -> io::Result<()> {
@@ -549,27 +566,16 @@ impl ClearPlan {
     }
 
     pub(crate) fn check_running(&self, ops: &impl ClearOps) -> io::Result<()> {
-        let names: std::collections::HashSet<_> = self
-            .targets
-            .iter()
-            .map(|target| target.name.as_str())
-            .collect();
-        for port in (FIRST_CONSOLE_PORT..=LAST_CONSOLE_PORT).step_by(2) {
-            if ops.console_owner(port)?.is_none() {
-                continue;
-            }
-            let name = ops.console_avd_name(port).map_err(|error| io::Error::new(error.kind(), format!("cannot authenticate host-owned emulator console on {port}; refusing clear: {error}")))?;
-            if names.contains(name.as_str()) {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("Managed AVD {name:?} is running as emulator-{port}. Stop it first with: emutrim stop {name}")));
-            }
-        }
-        Ok(())
+        check_targets_not_running(&self.targets, ops)
     }
 
     pub(crate) fn execute_with(mut self, ops: &impl ClearOps) -> io::Result<()> {
         validate_manifest_file(&self.layout)?;
         if self.targets.is_empty() {
             return Ok(());
+        }
+        for target in &self.targets {
+            reset::refuse_if_pending(&self.layout, target)?;
         }
         for target in &self.targets {
             validate_owned_path(&target.avd_dir, &canonical_avd_root(&self.layout)?, true)?;
@@ -607,6 +613,36 @@ impl ClearPlan {
         }
         result
     }
+}
+
+pub(crate) fn check_target_not_running(
+    target: &ClearTarget,
+    ops: &impl ClearOps,
+) -> io::Result<()> {
+    check_targets_not_running(std::slice::from_ref(target), ops)
+}
+
+fn check_targets_not_running(targets: &[ClearTarget], ops: &impl ClearOps) -> io::Result<()> {
+    let names: std::collections::HashSet<_> =
+        targets.iter().map(|target| target.name.as_str()).collect();
+    for port in (FIRST_CONSOLE_PORT..=LAST_CONSOLE_PORT).step_by(2) {
+        if ops.console_owner(port)?.is_none() {
+            continue;
+        }
+        let name = ops.console_avd_name(port).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot authenticate host-owned emulator console on {port}; refusing operation: {error}"),
+            )
+        })?;
+        if names.contains(name.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("Managed AVD {name:?} is running as emulator-{port}. Stop it first with: emutrim stop {name}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn prepare_manifest(path: &Path, value: &serde_json::Value) -> io::Result<PathBuf> {

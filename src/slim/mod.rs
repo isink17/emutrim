@@ -133,6 +133,7 @@ pub fn already_applied(addr: SocketAddr, serial: &str, options: &Options) -> io:
 }
 
 pub fn slim(addr: SocketAddr, serial: &str, options: &Options) -> io::Result<usize> {
+    crate::managed::reset::refuse_for_serial(&crate::managed::Layout::resolve()?, serial)?;
     if !is_emulator(serial, &run(addr, serial, "getprop ro.kernel.qemu")?) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -227,6 +228,7 @@ pub fn slim(addr: SocketAddr, serial: &str, options: &Options) -> io::Result<usi
 }
 
 pub fn restore(addr: SocketAddr, serial: &str) -> io::Result<Option<usize>> {
+    crate::managed::reset::refuse_for_serial(&crate::managed::Layout::resolve()?, serial)?;
     if !is_emulator(serial, &run(addr, serial, "getprop ro.kernel.qemu")?) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

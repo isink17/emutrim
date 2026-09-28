@@ -2,17 +2,15 @@ mod adb;
 mod avd;
 mod cli;
 mod commands;
+mod lifecycle;
 mod managed;
 mod output;
 mod platform;
 mod slim;
 
 use adb::protocol::remaining_until;
-use adb::shell::{
-    boot_completed, boot_completed_with_timeout, metadata, shell_v2, shell_v2_with_timeout,
-    DeviceMetadata,
-};
-use adb::track::{as_map, devices, devices_with_timeout, DeviceState, Tracker};
+use adb::shell::{boot_completed, metadata, shell_v2, DeviceMetadata};
+use adb::track::{as_map, devices, DeviceState, Tracker};
 use slim::Options;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -81,6 +79,7 @@ fn run() -> io::Result<()> {
         "tune-avd" => tune(args),
         "managed" => managed::run(args),
         "start" => start(args),
+        "reset" => commands::reset::run(args),
         "status" => {
             if args.iter().any(|arg| arg == "--json") {
                 commands::status::print_json_result(
@@ -293,167 +292,51 @@ fn start(args: Vec<String>) -> io::Result<()> {
     let managed = args.iter().any(|arg| arg == "--managed");
     let args: Vec<String> = args.into_iter().filter(|arg| arg != "--managed").collect();
     let (name, requested_ram, no_slim, timings, cold_boot, headless) = start_args(args)?;
-    let info = avd::inspect_mode(&name, managed)?;
-    let ram = requested_ram.unwrap_or(info.ram_mb);
-    avd::validate_ram(&info, ram)?;
-    if !info.image.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "AVD system image directory not found: {}",
-                info.image.display()
-            ),
-        ));
+    let layout = managed::Layout::resolve()?;
+    managed::reset::refuse_named(&layout, &name)?;
+    if managed {
+        managed::resolve_managed_avd(&layout, &name)?;
     }
-    if !no_slim && !platform::supports_verified_integrated_start() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "integrated start requires verified process-to-console identity support",
-        ));
-    }
-    let port = avd::available_console_port()?;
-    let serial = format!("emulator-{port}");
-    let mut child = avd::start_mode(&name, ram, port, cold_boot, headless, managed)?;
-    let mut timing = StartupTiming {
-        capture: timings,
-        launched: Some(Instant::now()),
-        ..StartupTiming::default()
-    };
-    let launch_pid = child.id();
-    println!("started {name} as {serial}");
-    println!("waiting for ADB transport...");
-    let transport_deadline = Instant::now() + Duration::from_secs(120);
-    let ready = wait_for_transport_with(
-        &serial,
-        transport_deadline,
-        |deadline| devices_with_timeout(default_adb_addr(), deadline),
-        || {
-            if no_slim {
-                Ok(Some(true))
-            } else {
-                match platform::console_owner_pid(port)? {
-                    Some(owner) => Ok(Some(platform::belongs_to_launch(owner, launch_pid)?)),
-                    None => Ok(None),
-                }
-            }
+    let launch = lifecycle::launch_and_wait(
+        &name,
+        requested_ram,
+        if cold_boot {
+            avd::SnapshotMode::ColdBoot
+        } else {
+            avd::SnapshotMode::Normal
         },
-        |deadline| {
-            let running = child.try_wait().map(|status| status.is_none())?;
-            let console = remaining_until(deadline).is_ok()
-                && avd::console::avd_name_until(port, deadline).is_ok_and(|actual| actual == name);
-            Ok((running, console))
-        },
-        |remaining| thread::sleep(remaining.min(Duration::from_millis(500))),
-        &mut timing,
+        headless,
+        managed,
+        !no_slim,
+        timings,
     )?;
-    if timing.console.is_none() {
-        if timings {
-            eprintln!("startup timing: {}", timing.format());
-        }
-        return Err(console_timeout_error(&name));
-    }
-    if !ready {
-        if timings {
-            eprintln!("startup timing: {}", timing.format());
-        }
-        return Err(transport_timeout_error(
-            &serial,
-            child.try_wait()?.is_none(),
-            timing.state.as_deref(),
-            timing.error.as_deref(),
-        ));
-    }
-    let qemu = shell_v2_with_timeout(
-        default_adb_addr(),
-        &serial,
-        "getprop ro.kernel.qemu",
-        Instant::now() + Duration::from_secs(3),
-    )?;
-    if qemu.status != 0 || !slim::is_emulator(&serial, &qemu.stdout) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("requested launch did not verify as emulator transport {serial}"),
-        ));
-    }
-
-    if timings {
-        println!("ADB transport ready: {serial} device; waiting for Android boot...");
+    let serial = launch.serial;
+    let result = if no_slim {
+        Ok(())
     } else {
-        println!("waiting for Android boot...");
-    }
-    let boot_deadline = Instant::now() + Duration::from_secs(120);
-    let mut action = None;
-    let boot_result = wait_for_boot_until(
-        &serial,
-        boot_deadline,
-        |deadline| {
-            let result = boot_completed_with_timeout(default_adb_addr(), &serial, deadline);
-            if matches!(&result, Ok(true)) {
-                timing.boot = Some(Instant::now());
-            }
-            result
-        },
-        || child.try_wait().map(|status| status.is_none()),
-        |remaining| thread::sleep(remaining.min(Duration::from_millis(500))),
-        || {
-            action = Some(if no_slim {
+        match slim_after_boot(default_adb_addr(), &serial)? {
+            SlimResult::AlreadyApplied => {
+                println!("already slimmed; no guest changes needed");
                 Ok(())
-            } else {
-                match slim_after_boot(default_adb_addr(), &serial) {
-                    Ok(SlimResult::AlreadyApplied) => {
-                        println!("already slimmed; no guest changes needed");
-                        Ok(())
-                    }
-                    Ok(SlimResult::Slimmed(count)) => {
-                        println!("slimmed {count} package(s)");
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                }
-            });
-        },
-    );
-    match boot_result? {
-        BootWait::Ready => {}
-        BootWait::TimedOut => {
-            if timings {
-                eprintln!("startup timing: {}", timing.format());
             }
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "Android boot timed out on {serial}; last state: {} (boot incomplete); guest was not modified",
-                    timing.state.as_deref().unwrap_or("absent")
-                ),
-            ));
+            SlimResult::Slimmed(count) => {
+                println!("slimmed {count} package(s)");
+                Ok(())
+            }
         }
-        BootWait::ProcessExited => {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("emulator process exited before Android boot completed on {serial}"),
-            ));
-        }
-    }
-    let result =
-        action.unwrap_or_else(|| Err(io::Error::other("boot completed without start action")));
+    };
     if no_slim && result.is_ok() {
         println!("guest was not modified");
     }
     if result.is_ok() && timings {
+        let mut timing = launch.timing;
         timing.ready = Some(Instant::now());
         println!("startup timing: {}", timing.format());
     }
     result
 }
 
-fn console_timeout_error(name: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::TimedOut,
-        format!("timed out waiting for authenticated console for {name} (launch→console phase)"),
-    )
-}
-
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct StartupTiming {
     capture: bool,
     launched: Option<Instant>,
@@ -570,6 +453,14 @@ fn start_args(args: Vec<String>) -> io::Result<(String, Option<u32>, bool, bool,
 
 fn default_adb_addr() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5037)
+}
+
+#[cfg(test)]
+fn console_timeout_error(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("timed out waiting for authenticated console for {name} (launch→console phase)"),
+    )
 }
 
 fn doctor(args: Vec<String>) -> io::Result<()> {
@@ -1270,6 +1161,19 @@ fn watch(config: Config) -> io::Result<()> {
     }
 }
 fn handle_ready(config: &Config, serial: &str, handled: &mut HashSet<String>) {
+    let layout = match managed::Layout::resolve() {
+        Ok(layout) => layout,
+        Err(error) => {
+            eprintln!("  cannot check reset state for {serial}: {error}");
+            handled.remove(serial);
+            return;
+        }
+    };
+    if let Err(error) = managed::reset::refuse_for_serial(&layout, serial) {
+        eprintln!("  reset pending for {serial}: {error}");
+        handled.remove(serial);
+        return;
+    }
     if !config.options.dry_run {
         match slim::already_applied(config.adb_addr(), serial, &config.options) {
             Ok(true) => {

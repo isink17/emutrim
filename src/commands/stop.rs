@@ -64,6 +64,33 @@ pub fn run(args: Vec<String>) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn stop_launched(serial: &str, expected_name: &str, launch_pid: u32) -> io::Result<()> {
+    let port = avd::console_port(serial).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid launched emulator serial",
+        )
+    })?;
+    let ops = SystemStopOps;
+    let owner = ops.console_owner_pid(port)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "launched emulator console disappeared",
+        )
+    })?;
+    if !platform::belongs_to_launch(owner, launch_pid)? || ops.avd_name(port)? != expected_name {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "emulator console no longer matches reset launch identity",
+        ));
+    }
+    verify_identity(port, serial, &ops)?;
+    ops.shutdown(port, Instant::now() + Duration::from_secs(3))?;
+    wait_until_closed(port, Instant::now() + STOP_TIMEOUT, || {
+        ops.console_owner_pid(port)
+    })
+}
+
 fn stop_target(target: &str, ops: &impl StopOps, timeout: Duration) -> io::Result<StopOutcome> {
     let by_serial = avd::console_port(target).is_some();
     let devices = ops.devices()?;

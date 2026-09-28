@@ -16,6 +16,7 @@ fn command_help_succeeds_and_describes_supported_syntax() {
         (&["doctor", "--help"], "--json"),
         (&["status", "--help"], "<SERIAL>"),
         (&["stop", "--help"], "<SERIAL|AVD>"),
+        (&["reset", "--help"], "-wipe-data"),
         (&["slim", "--help"], "--dry-run"),
         (&["restore", "--help"], "off is an alias"),
         (&["watch", "--help"], "--skip=GROUP"),
@@ -34,6 +35,22 @@ fn command_help_succeeds_and_describes_supported_syntax() {
         let output = emutrim(args);
         assert!(output.status.success(), "{args:?}: {:?}", output.stderr);
         assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+    }
+}
+
+#[test]
+fn reset_help_states_scope_confirmation_and_preserved_data() {
+    let output = emutrim(&["reset", "--help"]);
+    let help = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "managed AVD",
+        "dry-run",
+        "Running AVDs are refused",
+        "sdcard.img",
+        "leaves AVD stopped",
+        "incomplete reset blocks",
+    ] {
+        assert!(help.contains(expected), "missing {expected:?}: {help}");
     }
 }
 
