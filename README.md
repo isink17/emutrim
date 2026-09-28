@@ -1,10 +1,12 @@
 # EmuTrim
 
-EmuTrim starts Android emulators, waits for the exact emulator to finish booting, diagnoses common SDK and AVD problems, and can apply a reversible slimming profile to development AVDs. Use it for one-command startup, readiness checks, safe restore, and isolated disposable Android environments.
+EmuTrim starts an AVD, waits for the exact emulator to become ready, applies a reversible test-oriented profile, inspects its current state, and stops it safely. Use it for deterministic, test-ready emulator workflows and isolated disposable Android environments.
 
 ## Why EmuTrim?
 
 - Start an AVD and wait for its Android boot to complete with one command.
+- Inspect one exact ADB target with read-only `status`; stop an emulator by serial or exact AVD name.
+- Run headless with `start --headless`, or use JSON from `doctor`, `status`, and `list-avds`.
 - Diagnose SDK, AVD, ADB, image, and RAM configuration with `doctor`.
 - Apply a reversible profile to a development emulator, then restore its recorded state exactly.
 - Keep disposable EmuTrim test assets isolated from Android Studio installations.
@@ -70,9 +72,11 @@ Customize `slim` with repeatable options:
 
 | Command | Behavior and important options |
 | --- | --- |
-| `doctor [AVD] [--serial=SERIAL]` | Diagnose SDK, emulator, ADB, installed AVDs, image/config/RAM, optional target, and saved state. `--managed` selects managed assets. |
-| `list-avds` | List installed AVDs; add `--managed` for the managed environment. |
-| `start <AVD>` | Launch, wait for exact ADB transport and Android boot, then slim. Options: `--managed`, `--cold-boot` (bypass Quick Boot for this launch), `--no-slim`, `--timings`, `--ram=N`. |
+| `doctor [AVD] [--serial=SERIAL]` | Diagnose SDK, emulator, ADB, installed AVDs, image/config/RAM, optional target, and saved state. `--managed` selects managed assets; `--json` emits structured checks. |
+| `status <SERIAL>` | Read-only exact transport, identity, boot, saved state, AVD, and ownership report; `--json` emits structured output. |
+| `stop <SERIAL|AVD>` | Stop one authenticated emulator. Physical devices and ambiguous AVD names are refused. |
+| `list-avds` | List installed AVDs; add `--managed` for managed environment or `--json` for structured output. |
+| `start <AVD>` | Launch, wait for exact ADB transport and Android boot, then slim. Options: `--managed`, `--cold-boot` (bypass Quick Boot for this launch), `--headless` (use `-no-window`), `--no-slim`, `--timings`, `--ram=N`. |
 | `slim [SERIAL]` | Apply the reversible profile. Supports `--dry-run`, `--keep=PACKAGE`, and `--skip=GROUP`. |
 | `off [SERIAL]` | Alias for `restore`; restore recorded original state. |
 | `restore [SERIAL]` | Restore recorded package and setting state; retry incomplete restores safely. |
