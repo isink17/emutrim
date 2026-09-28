@@ -4,6 +4,10 @@ on:
   push:
     tags: ['v*']
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -74,22 +78,54 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Create release
+      - name: Publish or verify release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          expected=(
+            "emutrim-v${version}-windows-x86_64.zip"
+            "emutrim-v${version}-windows-x86_64.zip.sha256"
+            "emutrim-v${version}-macos-arm64.tar.gz"
+            "emutrim-v${version}-macos-arm64.tar.gz.sha256"
+          )
+
+          verify_release() {
+            local release_json="$1" asset
+            [[ "$(jq -r .tagName <<<"$release_json")" == "$tag" ]] || {
+              echo "Release tag does not match $tag" >&2
+              return 1
+            }
+            for asset in "${expected[@]}"; do
+              jq -e --arg name "$asset" '.assets | any(.name == $name)' <<<"$release_json" >/dev/null || {
+                echo "Existing release $tag is missing expected asset: $asset" >&2
+                return 1
+              }
+            done
+          }
+
+          if release_json="$(gh release view "$tag" --json tagName,assets 2>/dev/null)"; then
+            verify_release "$release_json"
+            echo "Release $tag already exists with expected assets; verified."
+            exit 0
+          fi
+
+          # A missing release has no verifiable assets; create it once. If another
+          # publisher wins the race, accept only its complete matching release.
           cat > release-notes.md <<'EOF'
-          EmuTrim 0.5.1
+          Release notes for this version are maintained separately.
 
-          Fixes:
-          - tune-avd selects 4096 MB by default for detected 16 KB images and 1536 MB for other configured images.
-          - Explicit RAM values retain existing validation; unresolved image configuration fails before backup or mutation.
-          - Added command-specific CLI help.
-
-          No emulator safety model changes. No new platform support.
+          Licensing: v0.5.0 and later is source-available under MIT with Commons Clause License Condition v1.0. v0.4.0 and earlier remain MIT.
 
           Platforms: Windows x86_64 and Apple Silicon macOS (arm64). macOS stats is not supported. Linux remains CI/core-only.
           EOF
-          gh release create "${GITHUB_REF_NAME}" dist/* \
-            --title "EmuTrim ${GITHUB_REF_NAME#v}" \
-            --notes-file release-notes.md
+          if gh release create "$tag" dist/* \
+            --title "EmuTrim $version" \
+            --notes-file release-notes.md; then
+            exit 0
+          fi
+
+          echo "Release creation failed; checking whether a concurrent publisher completed it." >&2
+          release_json="$(gh release view "$tag" --json tagName,assets)"
+          verify_release "$release_json"
