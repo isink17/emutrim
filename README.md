@@ -113,11 +113,14 @@ emutrim status emulator-5554
 emutrim stop My_AVD
 emutrim clear My_AVD
 emutrim clear My_AVD --yes
+emutrim clear all
+emutrim clear all --yes
+emutrim clear
 emutrim managed clean
 emutrim managed clean --yes
 ```
 
-`clear AVD_NAME` and `clear all` validate and print a dry-run plan; add `--yes` to delete. Bare `clear` uses an interactive managed-AVD selector and confirmation. `clear` removes only manifest-identified EmuTrim AVD definitions (`.ini`) and each AVD's mutable `.avd` directory. It never removes external AVDs, SDK packages, or system images. Running AVDs and uncertain console authentication are refused; stop explicitly before clearing. `clear all --yes` preflights every target before deleting any AVD.
+`clear` removes one or all EmuTrim-managed AVDs only; `managed clean` removes the full EmuTrim-managed Android environment. `clear AVD_NAME` and `clear all` validate and print a dry-run plan; add `--yes` to delete. Bare `clear` opens an interactive managed-AVD selector and confirmation, and refuses when stdin or stdout is not a terminal. `clear` removes only manifest-identified EmuTrim AVD definitions (`.ini`) and each AVD's mutable `.avd` directory. External AVDs are unsupported and left untouched. Running AVDs and uncertain console authentication are refused; stop explicitly before clearing. `clear all --yes` preflights every target before deleting any AVD.
 
 `managed clean --yes` has broader scope: it deletes the full EmuTrim-managed payload, including managed SDK and system images. `clear all --yes` preserves that environment so setup remains reusable.
 
