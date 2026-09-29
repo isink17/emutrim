@@ -60,6 +60,10 @@ impl Layout {
     }
 }
 
+pub(crate) fn ensure_emulator_home(layout: &Layout) -> io::Result<()> {
+    setup::ensure_emulator_home(layout)
+}
+
 pub fn run(args: Vec<String>) -> io::Result<()> {
     let action = args.first().map(String::as_str).unwrap_or("help");
     let layout = Layout::resolve()?;

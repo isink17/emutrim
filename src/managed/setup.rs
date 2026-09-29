@@ -585,7 +585,7 @@ fn load_or_plan(
     Option<AndroidSdkTool>,
 )> {
     if path_present(&layout.manifest)? {
-        let mut manifest = super::read_manifest(layout)?;
+        let manifest = super::read_manifest(layout)?;
         if manifest["host"].as_str() != Some(host.manifest_name())
             || manifest["arch"].as_str() != Some(host.abi())
         {
@@ -643,7 +643,6 @@ fn load_or_plan(
         if !super::safe_avd_name(&name) {
             return Err(super::invalid_manifest("managed AVD identity is invalid"));
         }
-        manifest["avds"] = serde_json::json!([name]);
         Ok((manifest, image, name, false, None))
     } else {
         let (tool, listing) = discover_tool(layout)?;
@@ -698,6 +697,28 @@ fn prepare_managed_dirs(layout: &Layout) -> io::Result<()> {
                 "managed path escapes configured root",
             ));
         }
+    }
+    ensure_emulator_home(layout)?;
+    Ok(())
+}
+
+pub(super) fn ensure_emulator_home(layout: &Layout) -> io::Result<()> {
+    let home = layout.tmp.join("emulator-home");
+    reject_reparse_ancestors(&home)?;
+    fs::create_dir_all(&home)?;
+    reject_reparse_ancestors(&home)?;
+    let root = layout.root.canonicalize()?;
+    let managed = layout.managed.canonicalize()?;
+    let tmp = layout.tmp.canonicalize()?;
+    let canonical_home = home.canonicalize()?;
+    if managed.parent() != Some(root.as_path())
+        || tmp.parent() != Some(managed.as_path())
+        || canonical_home.parent() != Some(tmp.as_path())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "managed Emulator home escapes managed root",
+        ));
     }
     Ok(())
 }
@@ -920,6 +941,15 @@ system-images/android-37.0/google_apis/arm64-v8a 6.0.0 description\n\
 system-images/android-37.1/google_apis_ps16k/arm64-v8a 1.0.0 description\n";
 
     #[test]
+    fn prepare_managed_dirs_creates_emulator_home() {
+        let root = temp_root("emulator home");
+        let layout = fixture_layout(root.clone());
+        prepare_managed_dirs(&layout).unwrap();
+        assert!(layout.tmp.join("emulator-home").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn parses_slash_and_semicolon_catalog_forms_and_selects_numeric_latest() {
         let images = parse_images(CATALOG);
         let win = select_image(&images, Host::WindowsX64).unwrap();
@@ -1003,7 +1033,8 @@ system-images/android-37.1/google_apis_ps16k/arm64-v8a 1.0.0 description\n";
             "avds": ["ExistingManaged"],
         });
         fs::write(&layout.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        let (_, image, name, fresh, tool) = load_or_plan(&layout, Host::WindowsX64).unwrap();
+        let (manifest, image, name, fresh, tool) = load_or_plan(&layout, Host::WindowsX64).unwrap();
+        assert_eq!(manifest["avds"], serde_json::json!(["ExistingManaged"]));
         assert_eq!(
             image.manifest_package(),
             "system-images;android-36.1;google_apis;x86_64"

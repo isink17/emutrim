@@ -405,6 +405,7 @@ pub fn start_mode(
         info.is_16k,
     ));
     if let Some(layout) = layout {
+        crate::managed::ensure_emulator_home(&layout)?;
         command
             .env("ANDROID_HOME", &sdk)
             .env("ANDROID_SDK_ROOT", &sdk)
