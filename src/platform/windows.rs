@@ -18,6 +18,10 @@ const TCP_TABLE_OWNER_PID_LISTENER: u32 = 3;
 const MIB_TCP_STATE_LISTEN: u32 = 2;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const WAIT_OBJECT_0: u32 = 0;
+const WAIT_TIMEOUT: u32 = 258;
+const WAIT_FAILED: u32 = u32::MAX;
 
 #[repr(C)]
 struct TcpRowOwnerPid {
@@ -88,6 +92,7 @@ extern "system" {
     fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
     fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
     fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> Handle;
+    fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
     fn QueryFullProcessImageNameW(
         process: Handle,
         flags: u32,
@@ -121,6 +126,43 @@ impl Drop for OwnedHandle {
         unsafe {
             CloseHandle(self.0);
         }
+    }
+}
+
+pub struct ProcessWatch {
+    process: OwnedHandle,
+}
+
+impl ProcessWatch {
+    pub fn open(pid: u32) -> io::Result<Self> {
+        if pid == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid process PID 0",
+            ));
+        }
+        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            process: OwnedHandle(handle),
+        })
+    }
+
+    pub fn is_alive(&self) -> io::Result<bool> {
+        process_wait_result(unsafe { WaitForSingleObject(self.process.0, 0) })
+    }
+}
+
+fn process_wait_result(result: u32) -> io::Result<bool> {
+    match result {
+        WAIT_OBJECT_0 => Ok(false),
+        WAIT_TIMEOUT => Ok(true),
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        result => Err(io::Error::other(format!(
+            "WaitForSingleObject returned unexpected result {result}"
+        ))),
     }
 }
 
@@ -233,6 +275,55 @@ fn process_tree() -> io::Result<HashMap<u32, (u32, u32)>> {
     Ok(processes)
 }
 
+pub fn process_parent_pid(pid: u32) -> io::Result<Option<u32>> {
+    let processes = process_tree()?;
+    let parent = processes
+        .get(&pid)
+        .map(|(parent, _)| *parent)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("process {pid} unavailable"),
+            )
+        })?;
+    Ok((parent != 0 && parent != pid).then_some(parent))
+}
+
+pub fn shutdown_helper_pids(pid: u32) -> io::Result<Vec<u32>> {
+    let target = pid.to_string();
+    let script = format!(
+        "$target='{target}'; Get-CimInstance Win32_Process | Where-Object {{ $_.Name -ieq 'emulator.exe' -and $_.CommandLine -match ('(?:^|\\s)-kill\\s+' + [regex]::Escape($target) + '(?:\\s|$)') }} | ForEach-Object {{ $_.ProcessId }}"
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "failed to inspect Emulator shutdown helper processes",
+        ));
+    }
+    parse_shutdown_helper_pids(&output.stdout)
+}
+
+fn parse_shutdown_helper_pids(output: &[u8]) -> io::Result<Vec<u32>> {
+    let text = std::str::from_utf8(output)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "helper PIDs are not UTF-8"))?;
+    let mut pids = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let pid = line
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid != 0)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "malformed helper PID output")
+            })?;
+        pids.push(pid);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
 pub fn belongs_to_launch(owner_pid: u32, launch_pid: u32) -> io::Result<bool> {
     let processes = process_tree()?;
     Ok(is_descendant_or_same(owner_pid, launch_pid, &processes))
@@ -340,5 +431,33 @@ mod tests {
     #[test]
     fn filetime_ticks_convert_to_cpu_seconds() {
         assert_eq!(cpu_seconds(5_000_000, 15_000_000), 2.0);
+    }
+
+    #[test]
+    fn process_wait_result_distinguishes_live_exited_and_failed() {
+        assert!(process_wait_result(WAIT_TIMEOUT).unwrap());
+        assert!(!process_wait_result(WAIT_OBJECT_0).unwrap());
+        assert!(process_wait_result(WAIT_FAILED).is_err());
+    }
+
+    #[test]
+    fn process_watch_keeps_handle_to_live_process() {
+        assert_eq!(
+            ProcessWatch::open(0).err().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let watch = ProcessWatch::open(std::process::id()).unwrap();
+        assert!(watch.is_alive().unwrap());
+    }
+
+    #[test]
+    fn shutdown_helper_pid_parser_is_strict_and_deduplicates() {
+        assert_eq!(
+            parse_shutdown_helper_pids(b"123\n123\n456\n").unwrap(),
+            [123, 456]
+        );
+        assert!(parse_shutdown_helper_pids(b"PID\n").is_err());
+        assert!(parse_shutdown_helper_pids(b"0\n").is_err());
+        assert!(parse_shutdown_helper_pids(b"\xff").is_err());
     }
 }

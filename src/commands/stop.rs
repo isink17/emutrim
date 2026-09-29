@@ -6,7 +6,34 @@ use std::time::{Duration, Instant};
 
 const FIRST_PORT: u16 = 5554;
 const LAST_PORT: u16 = 5682;
-const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+trait ProcessLiveness {
+    fn is_alive(&mut self) -> io::Result<bool>;
+}
+
+struct WatchedProcess<'a> {
+    pid: u32,
+    watch: Box<dyn ProcessLiveness + 'a>,
+}
+
+struct ProcessWatches<'a>(Vec<WatchedProcess<'a>>);
+
+impl ProcessLiveness for ProcessWatches<'_> {
+    fn is_alive(&mut self) -> io::Result<bool> {
+        let mut alive = false;
+        for process in &mut self.0 {
+            alive |= process.watch.is_alive()?;
+        }
+        Ok(alive)
+    }
+}
+
+impl ProcessLiveness for platform::ProcessWatch {
+    fn is_alive(&mut self) -> io::Result<bool> {
+        platform::ProcessWatch::is_alive(self)
+    }
+}
 
 trait StopOps {
     fn devices(&self) -> io::Result<Vec<adb::track::DeviceState>>;
@@ -14,6 +41,9 @@ trait StopOps {
     fn avd_name(&self, port: u16) -> io::Result<String>;
     fn shutdown(&self, port: u16, deadline: Instant) -> io::Result<()>;
     fn console_owner_pid(&self, port: u16) -> io::Result<Option<u32>>;
+    fn process_parent_pid(&self, pid: u32) -> io::Result<Option<u32>>;
+    fn shutdown_helper_pids(&self, pid: u32) -> io::Result<Vec<u32>>;
+    fn watch_process(&self, pid: u32) -> io::Result<Box<dyn ProcessLiveness + '_>>;
     fn avd_exists(&self, name: &str) -> bool;
 }
 
@@ -34,6 +64,15 @@ impl StopOps for SystemStopOps {
     }
     fn console_owner_pid(&self, port: u16) -> io::Result<Option<u32>> {
         platform::console_owner_pid(port)
+    }
+    fn process_parent_pid(&self, pid: u32) -> io::Result<Option<u32>> {
+        platform::process_parent_pid(pid)
+    }
+    fn shutdown_helper_pids(&self, pid: u32) -> io::Result<Vec<u32>> {
+        platform::shutdown_helper_pids(pid)
+    }
+    fn watch_process(&self, pid: u32) -> io::Result<Box<dyn ProcessLiveness + '_>> {
+        Ok(Box::new(platform::ProcessWatch::open(pid)?))
     }
     fn avd_exists(&self, name: &str) -> bool {
         avd::config_path_mode(name, false).is_ok() || avd::config_path_mode(name, true).is_ok()
@@ -85,10 +124,7 @@ pub(crate) fn stop_launched(serial: &str, expected_name: &str, launch_pid: u32) 
         ));
     }
     verify_identity(port, serial, &ops)?;
-    ops.shutdown(port, Instant::now() + Duration::from_secs(3))?;
-    wait_until_closed(port, Instant::now() + STOP_TIMEOUT, || {
-        ops.console_owner_pid(port)
-    })
+    stop_authenticated(port, serial, owner, expected_name, &ops, STOP_TIMEOUT)
 }
 
 fn stop_target(target: &str, ops: &impl StopOps, timeout: Duration) -> io::Result<StopOutcome> {
@@ -146,12 +182,61 @@ fn stop_target(target: &str, ops: &impl StopOps, timeout: Duration) -> io::Resul
             });
         }
     };
-    let (port, _owner, name) = selected;
-    ops.shutdown(port, Instant::now() + Duration::from_secs(3))?;
-    wait_until_closed(port, Instant::now() + timeout, || {
-        ops.console_owner_pid(port)
-    })?;
+    let (port, owner, name) = selected;
+    stop_authenticated(
+        port,
+        &format!("emulator-{port}"),
+        owner,
+        &name,
+        ops,
+        timeout,
+    )?;
     Ok(StopOutcome::Stopped { port, name })
+}
+
+fn stop_authenticated(
+    port: u16,
+    serial: &str,
+    owner_pid: u32,
+    name: &str,
+    ops: &impl StopOps,
+    timeout: Duration,
+) -> io::Result<()> {
+    let owner_process = ops.watch_process(owner_pid)?;
+    let mut processes = ProcessWatches(vec![WatchedProcess {
+        pid: owner_pid,
+        watch: owner_process,
+    }]);
+    if !processes.0[0].watch.is_alive()? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "authenticated emulator process exited before shutdown; refusing stop",
+        ));
+    }
+    if let Some(parent_pid) = ops.process_parent_pid(owner_pid)? {
+        let parent = ops.watch_process(parent_pid)?;
+        if !processes.0[0].watch.is_alive()?
+            || ops.process_parent_pid(owner_pid)? != Some(parent_pid)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "emulator process ancestry changed before shutdown; refusing stop",
+            ));
+        }
+        processes.0.push(WatchedProcess {
+            pid: parent_pid,
+            watch: parent,
+        });
+    }
+    if ops.console_owner_pid(port)? != Some(owner_pid) || ops.avd_name(port)? != name {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "emulator console identity changed before shutdown; refusing stop",
+        ));
+    }
+    let deadline = Instant::now() + timeout;
+    ops.shutdown(port, Instant::now() + Duration::from_secs(3))?;
+    wait_until_stopped(port, serial, owner_pid, deadline, ops, &mut processes)
 }
 
 type Candidate = (u16, u32, String);
@@ -189,19 +274,86 @@ fn select_candidate(
     }
 }
 
-fn wait_until_closed(
+fn wait_until_stopped<'a>(
     port: u16,
+    serial: &str,
+    owner_pid: u32,
     deadline: Instant,
-    mut owner: impl FnMut() -> io::Result<Option<u32>>,
+    ops: &'a impl StopOps,
+    processes: &mut ProcessWatches<'a>,
 ) -> io::Result<()> {
+    let mut process_exit_at = None;
+    let mut next_helper_check = Instant::now();
+    let mut shutdown_helpers = Vec::new();
+    let mut helpers_clear_since = None;
     loop {
-        if owner()?.is_none() {
+        let now = Instant::now();
+        if now >= next_helper_check {
+            shutdown_helpers = ops.shutdown_helper_pids(owner_pid)?;
+            for pid in &shutdown_helpers {
+                if !processes.0.iter().any(|process| process.pid == *pid) {
+                    match ops.watch_process(*pid) {
+                        Ok(watch) => processes.0.push(WatchedProcess { pid: *pid, watch }),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            next_helper_check = now + Duration::from_millis(500);
+        }
+        let process_alive = processes.is_alive()?;
+        if process_alive {
+            process_exit_at = None;
+        } else {
+            process_exit_at.get_or_insert_with(Instant::now);
+        }
+        let console_owner = ops.console_owner_pid(port)?;
+        if let Some(pid) = console_owner.filter(|pid| *pid != owner_pid) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "console port {port} was reused by PID {pid} after shutdown began; refusing to follow it"
+                ),
+            ));
+        }
+        let devices = ops.devices()?;
+        let adb_state = devices
+            .iter()
+            .find(|device| device.serial == serial)
+            .map(|device| device.state.as_str());
+        if !process_alive
+            && console_owner == Some(owner_pid)
+            && process_exit_at.is_some_and(|exited| exited.elapsed() >= Duration::from_secs(1))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "original process {owner_pid} exited but console port {port} still reports its PID; refusing ambiguous shutdown completion"
+                ),
+            ));
+        }
+        if process_alive || !shutdown_helpers.is_empty() {
+            helpers_clear_since = None;
+        } else {
+            helpers_clear_since.get_or_insert_with(Instant::now);
+        }
+        if !process_alive
+            && console_owner.is_none()
+            && adb_state.is_none()
+            && helpers_clear_since.is_some_and(|clear| clear.elapsed() >= Duration::from_secs(1))
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("emulator-{port} console still owns port after shutdown timeout"),
+                format!(
+                    "emulator-{port} shutdown timed out: original process {}; console listener {}; exact ADB transport {}; shutdown helper {}",
+                    if process_alive { "still alive" } else { "exited" },
+                    if console_owner.is_some() { "still present" } else { "absent" },
+                    adb_state.unwrap_or("absent"),
+                    if shutdown_helpers.is_empty() { "absent" } else { "still active" }
+                ),
             ));
         }
         thread::sleep(
@@ -258,6 +410,12 @@ mod tests {
         names: HashMap<u16, String>,
         auth_fail: HashSet<u16>,
         owners: RefCell<HashMap<u16, VecDeque<Option<u32>>>>,
+        post_kill_devices: RefCell<VecDeque<Vec<adb::track::DeviceState>>>,
+        process_states: RefCell<VecDeque<bool>>,
+        shutdown_helpers: RefCell<VecDeque<Vec<u32>>>,
+        parent_pid: Option<u32>,
+        parent_process_states: RefCell<VecDeque<bool>>,
+        watched_pids: RefCell<Vec<u32>>,
         exists: HashSet<String>,
         kill_fails: bool,
         kills: RefCell<Vec<u16>>,
@@ -269,6 +427,14 @@ mod tests {
 
     impl StopOps for FakeOps {
         fn devices(&self) -> io::Result<Vec<adb::track::DeviceState>> {
+            self.events.borrow_mut().push("devices");
+            if !self.kills.borrow().is_empty() {
+                return Ok(self
+                    .post_kill_devices
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or_default());
+            }
             Ok(self.devices.clone())
         }
 
@@ -322,8 +488,47 @@ mod tests {
             Ok(owner)
         }
 
+        fn process_parent_pid(&self, _pid: u32) -> io::Result<Option<u32>> {
+            Ok(self.parent_pid)
+        }
+
+        fn shutdown_helper_pids(&self, _pid: u32) -> io::Result<Vec<u32>> {
+            self.events.borrow_mut().push("helper");
+            Ok(self
+                .shutdown_helpers
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_default())
+        }
+
+        fn watch_process(&self, pid: u32) -> io::Result<Box<dyn ProcessLiveness + '_>> {
+            self.events.borrow_mut().push("watch");
+            self.watched_pids.borrow_mut().push(pid);
+            Ok(Box::new(FakeProcessLiveness { ops: self, pid }))
+        }
+
         fn avd_exists(&self, name: &str) -> bool {
             self.exists.contains(name)
+        }
+    }
+
+    struct FakeProcessLiveness<'a> {
+        ops: &'a FakeOps,
+        pid: u32,
+    }
+
+    impl ProcessLiveness for FakeProcessLiveness<'_> {
+        fn is_alive(&mut self) -> io::Result<bool> {
+            self.ops.events.borrow_mut().push("process");
+            let states = if self.pid == 42 {
+                &self.ops.process_states
+            } else {
+                &self.ops.parent_process_states
+            };
+            Ok(states
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| self.ops.kills.borrow().is_empty()))
         }
     }
 
@@ -346,6 +551,13 @@ mod tests {
         };
         owners(&ops, 5554, [Some(42), Some(42), None]);
         ops
+    }
+
+    fn process_watches(ops: &FakeOps, pid: u32) -> ProcessWatches<'_> {
+        ProcessWatches(vec![WatchedProcess {
+            pid,
+            watch: Box::new(FakeProcessLiveness { ops, pid }),
+        }])
     }
 
     fn owners(ops: &FakeOps, port: u16, sequence: impl IntoIterator<Item = Option<u32>>) {
@@ -393,17 +605,162 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_wait_requires_console_disappearance() {
-        let mut owners = [Some(12), None].into_iter();
-        wait_until_closed(5554, Instant::now() + Duration::from_secs(1), || {
-            Ok(owners.next().flatten())
-        })
+    fn console_and_adb_disappearance_do_not_override_live_original_process() {
+        let ops = FakeOps {
+            process_states: RefCell::new([true, false].into()),
+            post_kill_devices: RefCell::new(
+                [vec![device("emulator-5554", "device")], vec![]].into(),
+            ),
+            ..Default::default()
+        };
+        ops.kills.borrow_mut().push(5554);
+        owners(&ops, 5554, [None, None]);
+        let mut processes = process_watches(&ops, 42);
+        wait_until_stopped(
+            5554,
+            "emulator-5554",
+            42,
+            Instant::now() + Duration::from_secs(3),
+            &ops,
+            &mut processes,
+        )
         .unwrap();
-        let error = wait_until_closed(5554, Instant::now() + Duration::from_millis(1), || {
-            Ok(Some(12))
-        })
+        assert_eq!(ops.process_states.borrow().len(), 0);
+    }
+
+    #[test]
+    fn shutdown_over_ten_seconds_can_complete_within_thirty_second_bound() {
+        let ops = FakeOps {
+            process_states: RefCell::new(std::iter::repeat_n(true, 102).chain([false]).collect()),
+            ..Default::default()
+        };
+        ops.kills.borrow_mut().push(5554);
+        owners(&ops, 5554, std::iter::repeat_n(Some(42), 102).chain([None]));
+        let mut processes = process_watches(&ops, 42);
+        let start = Instant::now();
+        wait_until_stopped(
+            5554,
+            "emulator-5554",
+            42,
+            start + STOP_TIMEOUT,
+            &ops,
+            &mut processes,
+        )
+        .unwrap();
+        assert!(start.elapsed() > Duration::from_secs(10));
+    }
+
+    #[test]
+    fn adb_offline_must_disappear_and_stale_entry_times_out() {
+        let ops = FakeOps {
+            post_kill_devices: RefCell::new(
+                [vec![device("emulator-5554", "offline")], vec![]].into(),
+            ),
+            ..Default::default()
+        };
+        ops.kills.borrow_mut().push(5554);
+        owners(&ops, 5554, [None, None]);
+        let mut processes = process_watches(&ops, 42);
+        wait_until_stopped(
+            5554,
+            "emulator-5554",
+            42,
+            Instant::now() + Duration::from_secs(3),
+            &ops,
+            &mut processes,
+        )
+        .unwrap();
+
+        let stale = FakeOps {
+            post_kill_devices: RefCell::new(vec![vec![device("emulator-5554", "offline")]].into()),
+            ..Default::default()
+        };
+        stale.kills.borrow_mut().push(5554);
+        let mut processes = process_watches(&stale, 42);
+        let error = wait_until_stopped(
+            5554,
+            "emulator-5554",
+            42,
+            Instant::now(),
+            &stale,
+            &mut processes,
+        )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("exact ADB transport offline"));
+    }
+
+    #[test]
+    fn different_listener_after_shutdown_is_never_adopted() {
+        let ops = serial_fake("Pixel", "offline");
+        owners(&ops, 5554, [Some(42), Some(42), Some(99)]);
+        let error = stop_target("emulator-5554", &ops, Duration::from_secs(1)).unwrap_err();
+        assert!(error.to_string().contains("reused by PID 99"));
+        assert_eq!(&*ops.kills.borrow(), &[5554]);
+    }
+
+    #[test]
+    fn waits_for_original_emulator_parent_after_qemu_exits() {
+        let ops = FakeOps {
+            devices: vec![device("emulator-5554", "offline")],
+            names: HashMap::from([(5554, "Pixel".into())]),
+            parent_pid: Some(84),
+            process_states: RefCell::new([true, true].into()),
+            parent_process_states: RefCell::new([true, false].into()),
+            ..Default::default()
+        };
+        owners(&ops, 5554, [Some(42), Some(42), None, None]);
+        let result = stop_target("emulator-5554", &ops, Duration::from_secs(3));
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(&*ops.watched_pids.borrow(), &[42, 84]);
+    }
+
+    #[test]
+    fn waits_for_emulator_shutdown_helper_bound_to_captured_qemu_pid() {
+        let ops = FakeOps {
+            parent_process_states: RefCell::new([true, false].into()),
+            shutdown_helpers: RefCell::new([vec![], vec![88], vec![88], vec![]].into()),
+            ..Default::default()
+        };
+        ops.kills.borrow_mut().push(5554);
+        owners(&ops, 5554, [None]);
+        let mut processes = ProcessWatches(vec![WatchedProcess {
+            pid: 42,
+            watch: Box::new(FakeProcessLiveness { ops: &ops, pid: 42 }),
+        }]);
+        let started = Instant::now();
+        wait_until_stopped(
+            5554,
+            "emulator-5554",
+            42,
+            started + STOP_TIMEOUT,
+            &ops,
+            &mut processes,
+        )
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(&*ops.watched_pids.borrow(), &[88]);
+    }
+
+    #[test]
+    fn same_pid_listener_after_captured_process_exit_is_ambiguous() {
+        let ops = FakeOps::default();
+        ops.kills.borrow_mut().push(5554);
+        owners(&ops, 5554, std::iter::repeat_n(Some(42), 20));
+        let mut processes = process_watches(&ops, 42);
+        ops.process_states.borrow_mut().push_back(false);
+        let error = wait_until_stopped(
+            5554,
+            "emulator-5554",
+            42,
+            Instant::now() + Duration::from_secs(2),
+            &ops,
+            &mut processes,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refusing ambiguous shutdown completion"));
     }
 
     #[test]
@@ -418,6 +775,19 @@ mod tests {
             .to_string()
             .contains("fake console authentication failed"));
         assert_eq!(&*ops.auth_calls.borrow(), &[5554]);
+        no_kill(&ops);
+    }
+
+    #[test]
+    fn process_that_exits_before_kill_is_not_stopped() {
+        let ops = serial_fake("Pixel", "offline");
+        ops.process_states.borrow_mut().push_back(false);
+        assert_eq!(
+            stop_target("emulator-5554", &ops, Duration::ZERO)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
         no_kill(&ops);
     }
 
@@ -453,7 +823,7 @@ mod tests {
     #[test]
     fn offline_exact_transport_skips_qemu_then_kills_and_waits_for_disappearance() {
         let ops = serial_fake("Pixel", "offline");
-        let outcome = stop_target("emulator-5554", &ops, Duration::from_secs(1)).unwrap();
+        let outcome = stop_target("emulator-5554", &ops, Duration::from_secs(3)).unwrap();
         assert_eq!(
             outcome,
             StopOutcome::Stopped {
@@ -534,7 +904,7 @@ mod tests {
         owners(&ops, 5554, [Some(10)]);
         owners(&ops, 5556, [Some(11), Some(11), None]);
         assert_eq!(
-            stop_target("Pixel_9_API_36", &ops, Duration::from_secs(1)).unwrap(),
+            stop_target("Pixel_9_API_36", &ops, Duration::from_secs(3)).unwrap(),
             StopOutcome::Stopped {
                 port: 5556,
                 name: "Pixel_9_API_36".into()
@@ -580,12 +950,13 @@ mod tests {
         assert_eq!(&*failed.kills.borrow(), &[5554]);
         assert_eq!(
             failed.owner_events.borrow().len(),
-            1,
+            2,
             "wait ran after failed kill"
         );
 
         let timeout = FakeOps {
             devices: vec![device("emulator-5554", "offline")],
+            process_states: RefCell::new([true, true].into()),
             names: HashMap::from([(5554, "Pixel".into())]),
             ..Default::default()
         };

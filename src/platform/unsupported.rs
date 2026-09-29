@@ -13,6 +13,38 @@ pub fn console_owner_pid(_port: u16) -> io::Result<Option<u32>> {
     ))
 }
 
+pub struct ProcessWatch;
+
+impl ProcessWatch {
+    pub fn open(_pid: u32) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process liveness checks are unsupported on this host",
+        ))
+    }
+
+    pub fn is_alive(&self) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process liveness checks are unsupported on this host",
+        ))
+    }
+}
+
+pub fn process_parent_pid(_pid: u32) -> io::Result<Option<u32>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process parent lookup is unsupported on this host",
+    ))
+}
+
+pub fn shutdown_helper_pids(_pid: u32) -> io::Result<Vec<u32>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Emulator shutdown helper lookup is unsupported on this host",
+    ))
+}
+
 pub fn belongs_to_launch(_owner_pid: u32, _launch_pid: u32) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
