@@ -942,7 +942,10 @@ system-images/android-37.1/google_apis_ps16k/arm64-v8a 1.0.0 description\n";
 
     #[test]
     fn prepare_managed_dirs_creates_emulator_home() {
-        let root = temp_root("emulator home");
+        let home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir);
+        let root = home.join(format!(".emutrim-emulator-home-{}", std::process::id()));
         let layout = fixture_layout(root.clone());
         prepare_managed_dirs(&layout).unwrap();
         assert!(layout.tmp.join("emulator-home").is_dir());
