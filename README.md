@@ -87,12 +87,14 @@ Customize `slim` with repeatable options:
 | `tune-avd [AVD] [--managed] [--ram=N]` | Update AVD RAM/GPU settings after backing up `config.ini`; without `--ram`, selects 4096 MB for detected 16 KB images and 1536 MB for other configured images. Missing image paths fail safely. Omitting AVD works only when exactly one is installed in selected environment. |
 | `managed root` | Print EmuTrim data root. |
 | `managed status` | Report isolated managed SDK/AVD setup. |
-| `managed setup` | Set up managed Android assets; currently supported on Apple Silicon macOS. |
+| `managed setup` | Set up managed Android assets on Windows x86_64 or Apple Silicon macOS arm64. Selects latest stable ordinary Google APIs image for host architecture. |
 | `managed clean [--yes]` | Preview managed cleanup; `--yes` deletes managed payloads. |
 | `clear [AVD_NAME|all] [--yes]` | Preview or remove only positively identified EmuTrim-managed AVD definitions and their mutable files. |
 | `reset <AVD_NAME> [--yes]` | Preview or factory-reset guest userdata of one positively identified managed AVD; retains AVD and SD-card image. |
 
 `off` and `restore` accept an optional serial; without one, EmuTrim selects the sole running emulator and refuses ambiguity. `--ram=N` is in MB. `--cold-boot` does not wipe data or delete snapshots. `--timings` reports startup phases.
+
+Managed setup uses an available Android SDK management CLI only to install packages into the isolated EmuTrim SDK. It selects the latest stable ordinary Google APIs system image available for the supported host architecture; API levels can differ by host. Licenses are never auto-accepted. Managed AVDs remain under the EmuTrim root, separate from Android Studio AVDs.
 
 ## Inspect and stop
 

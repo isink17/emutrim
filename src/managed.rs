@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 pub(crate) mod reset;
+mod setup;
 
 #[derive(Clone, Debug)]
 pub struct Layout {
@@ -84,7 +85,7 @@ pub fn run(args: Vec<String>) -> io::Result<()> {
         }
         "setup" if args.len() == 1 => setup(&layout),
         "help" if args.len() == 1 => {
-            println!("managed root|status|setup|clean [--yes]\nDefault EmuTrim managed root: ~/.emutrim\nOverride: EMUTRIM_HOME");
+            println!("managed root|status|setup|clean [--yes]\nManaged setup supports Windows x86_64 and Apple Silicon macOS arm64.\nDefault EmuTrim managed root: ~/.emutrim\nOverride: EMUTRIM_HOME");
             Ok(())
         }
         _ => Err(io::Error::new(
@@ -146,7 +147,7 @@ fn disk_usage(path: &Path) -> io::Result<u64> {
         return Ok(0);
     }
     let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() {
+    if is_link_or_reparse(&meta) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "managed tree contains symlink; refusing unsafe traversal",
@@ -220,6 +221,9 @@ const LAST_CONSOLE_PORT: u16 = 5682;
 pub(crate) trait ClearOps {
     fn console_owner(&self, port: u16) -> io::Result<Option<u32>>;
     fn console_avd_name(&self, port: u16) -> io::Result<String>;
+    fn managed_emulator_pids(&self, _emulator_dir: &Path) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
         fs::remove_dir_all(path)
     }
@@ -239,6 +243,9 @@ impl ClearOps for SystemClearOps {
     }
     fn console_avd_name(&self, port: u16) -> io::Result<String> {
         crate::avd::console::avd_name(port)
+    }
+    fn managed_emulator_pids(&self, emulator_dir: &Path) -> io::Result<Vec<String>> {
+        running_managed_emulators_in(emulator_dir)
     }
 }
 
@@ -566,7 +573,7 @@ impl ClearPlan {
     }
 
     pub(crate) fn check_running(&self, ops: &impl ClearOps) -> io::Result<()> {
-        check_targets_not_running(&self.targets, ops)
+        check_targets_not_running(&self.targets, &self.layout, ops)
     }
 
     pub(crate) fn execute_with(mut self, ops: &impl ClearOps) -> io::Result<()> {
@@ -617,12 +624,29 @@ impl ClearPlan {
 
 pub(crate) fn check_target_not_running(
     target: &ClearTarget,
+    layout: &Layout,
     ops: &impl ClearOps,
 ) -> io::Result<()> {
-    check_targets_not_running(std::slice::from_ref(target), ops)
+    check_targets_not_running(std::slice::from_ref(target), layout, ops)
 }
 
-fn check_targets_not_running(targets: &[ClearTarget], ops: &impl ClearOps) -> io::Result<()> {
+fn check_targets_not_running(
+    targets: &[ClearTarget],
+    layout: &Layout,
+    ops: &impl ClearOps,
+) -> io::Result<()> {
+    if !targets.is_empty() {
+        let pids = ops.managed_emulator_pids(&layout.sdk.join("emulator"))?;
+        if !pids.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "managed Emulator process running; PID(s): {}",
+                    pids.join(", ")
+                ),
+            ));
+        }
+    }
     let names: std::collections::HashSet<_> =
         targets.iter().map(|target| target.name.as_str()).collect();
     for port in (FIRST_CONSOLE_PORT..=LAST_CONSOLE_PORT).step_by(2) {
@@ -716,6 +740,10 @@ fn emulator_pids(processes: &str, emulator_dir: &Path) -> Vec<String> {
 
 #[cfg(windows)]
 fn running_managed_emulators(layout: &Layout) -> io::Result<Vec<String>> {
+    running_managed_emulators_in(&layout.sdk.join("emulator"))
+}
+
+fn running_managed_emulators_in(emulator_dir: &Path) -> io::Result<Vec<String>> {
     let output = Command::new("powershell")
         .args(["-NoProfile", "-Command", "Get-CimInstance Win32_Process | ForEach-Object { if ($_.ExecutablePath) { \"$($_.ProcessId)|$($_.ExecutablePath)\" } }"])
         .output()?;
@@ -729,15 +757,20 @@ fn running_managed_emulators(layout: &Layout) -> io::Result<Vec<String>> {
         .filter_map(|line| {
             let (pid, path) = line.split_once('|')?;
             Path::new(path)
-                .starts_with(layout.sdk.join("emulator"))
+                .starts_with(emulator_dir)
                 .then(|| format!("{pid} {path}\n"))
         })
         .collect();
-    Ok(emulator_pids(&processes, &layout.sdk.join("emulator")))
+    Ok(emulator_pids(&processes, emulator_dir))
 }
 
 #[cfg(unix)]
 fn running_managed_emulators(layout: &Layout) -> io::Result<Vec<String>> {
+    running_managed_emulators_in(&layout.sdk.join("emulator"))
+}
+
+#[cfg(unix)]
+fn running_managed_emulators_in(emulator_dir: &Path) -> io::Result<Vec<String>> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,command="])
         .output()?;
@@ -748,182 +781,12 @@ fn running_managed_emulators(layout: &Layout) -> io::Result<Vec<String>> {
     }
     Ok(emulator_pids(
         &String::from_utf8_lossy(&output.stdout),
-        &layout.sdk.join("emulator"),
+        emulator_dir,
     ))
 }
 
 fn setup(layout: &Layout) -> io::Result<()> {
-    if !cfg!(target_os = "macos") || !cfg!(target_arch = "aarch64") {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "managed setup currently supports macOS Apple Silicon only",
-        ));
-    }
-    fs::create_dir_all(&layout.tmp)?;
-    fs::create_dir_all(&layout.avd)?;
-    let external_sdk = crate::avd::sdk_dir()?;
-    if external_sdk
-        .canonicalize()?
-        .starts_with(layout.managed.canonicalize()?)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "bootstrap sdkmanager must come from an external user SDK",
-        ));
-    }
-    let tools = external_sdk.join("cmdline-tools");
-    let bootstrap = read_dirs(&tools)?
-        .into_iter()
-        .map(|version| version.join("bin/sdkmanager"))
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("bootstrap sdkmanager not found under {}", tools.display()),
-            )
-        })?;
-    let listing = Command::new(&bootstrap)
-        .arg(format!("--sdk_root={}", layout.sdk.display()))
-        .arg("--list")
-        .env("ANDROID_HOME", &layout.sdk)
-        .env("ANDROID_SDK_ROOT", &layout.sdk)
-        .env("ANDROID_AVD_HOME", &layout.avd)
-        .env("ANDROID_USER_HOME", layout.tmp.join("android-user"))
-        .env("ANDROID_EMULATOR_HOME", layout.tmp.join("emulator-home"))
-        .env("TMPDIR", &layout.tmp)
-        .output()?;
-    if !listing.status.success() {
-        return Err(io::Error::other(format!(
-            "sdkmanager --list failed: {}",
-            String::from_utf8_lossy(&listing.stderr).trim()
-        )));
-    }
-    let text = String::from_utf8_lossy(&listing.stdout);
-    let image = text
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| {
-            let package = line.split_whitespace().next()?;
-            (package.starts_with("system-images;android-")
-                && package.contains(";google_apis;arm64-v8a")
-                && !package.to_ascii_lowercase().contains("preview"))
-            .then_some(package)
-        })
-        .max_by_key(|line| {
-            line.split(';')
-                .nth(1)
-                .and_then(|api| api.strip_prefix("android-"))
-                .and_then(|api| api.parse::<u32>().ok())
-                .unwrap_or(0)
-        })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "no stable google_apis arm64-v8a system image listed by sdkmanager",
-            )
-        })?;
-    let packages = ["cmdline-tools;latest", "platform-tools", "emulator", image];
-    for package in packages {
-        let result = Command::new(&bootstrap)
-            .arg(format!("--sdk_root={}", layout.sdk.display()))
-            .arg(package)
-            .env("ANDROID_HOME", &layout.sdk)
-            .env("ANDROID_SDK_ROOT", &layout.sdk)
-            .env("ANDROID_AVD_HOME", &layout.avd)
-            .env("ANDROID_USER_HOME", layout.tmp.join("android-user"))
-            .env("ANDROID_EMULATOR_HOME", layout.tmp.join("emulator-home"))
-            .env("TMPDIR", &layout.tmp)
-            .status()?;
-        if !result.success() {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("sdkmanager failed for {package}; accept required licenses explicitly with `{} --sdk_root={} --licenses`", bootstrap.display(), layout.sdk.display())));
-        }
-        let installed = match package {
-            "cmdline-tools;latest" => layout
-                .sdk
-                .join("cmdline-tools/latest/bin/avdmanager")
-                .is_file(),
-            "platform-tools" => layout.sdk.join("platform-tools/adb").is_file(),
-            "emulator" => crate::avd::emulator_path(&layout.sdk).is_file(),
-            _ => layout
-                .sdk
-                .join(package.replace(';', "/"))
-                .join("package.xml")
-                .is_file(),
-        };
-        if !installed {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("SDK package {package} is absent; if sdkmanager reported an unaccepted license, accept it with `{} --sdk_root={} --licenses`", bootstrap.display(), layout.sdk.display()),
-            ));
-        }
-    }
-    let name = "EmuTrim_Mac_Acceptance_20260927";
-    let avd_path = layout.avd.join(format!("{name}.avd"));
-    let avd_ini = layout.avd.join(format!("{name}.ini"));
-    if avd_path.exists() || avd_ini.exists() {
-        let manifest = fs::read_to_string(&layout.manifest).unwrap_or_default();
-        let config = avd_path.join("config.ini");
-        if !manifest.lines().any(|line| line.trim() == "\"schema\": 1,")
-            || !manifest
-                .lines()
-                .any(|line| line.trim() == format!("\"avds\": [\"{name}\"]"))
-            || !manifest
-                .lines()
-                .any(|line| line.trim() == format!("\"system_image\": \"{image}\","))
-            || !config.is_file()
-            || !fs::read_to_string(&config)?.contains(&image.replace(';', "/"))
-            || crate::avd::config_path_mode(name, true).is_err()
-        {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("managed AVD {name} exists without matching EmuTrim manifest and config; refusing overwrite")));
-        }
-    } else {
-        let manager = layout.sdk.join("cmdline-tools/latest/bin/avdmanager");
-        if !manager.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("avdmanager missing: {}", manager.display()),
-            ));
-        }
-        let output = Command::new(manager)
-            .args([
-                "create",
-                "avd",
-                "--name",
-                name,
-                "--package",
-                image,
-                "--path",
-            ])
-            .arg(&avd_path)
-            .arg("--device")
-            .arg("pixel_2")
-            .env("ANDROID_HOME", &layout.sdk)
-            .env("ANDROID_SDK_ROOT", &layout.sdk)
-            .env("ANDROID_AVD_HOME", &layout.avd)
-            .env("ANDROID_USER_HOME", layout.tmp.join("android-user"))
-            .env("ANDROID_EMULATOR_HOME", layout.tmp.join("emulator-home"))
-            .env("TMPDIR", &layout.tmp)
-            .output()?;
-        if !output.status.success() {
-            return Err(io::Error::other(format!(
-                "avdmanager failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        if !avd_path.join("config.ini").is_file()
-            || !avd_ini.is_file()
-            || crate::avd::config_path_mode(name, true).is_err()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "AVD creation did not produce config.ini and managed .ini under managed AVD home",
-            ));
-        }
-    }
-    let manifest = format!("{{\n  \"schema\": 1,\n  \"sdk_packages\": [\"cmdline-tools;latest\", \"platform-tools\", \"emulator\", \"{image}\"],\n  \"system_image\": \"{image}\",\n  \"arch\": \"arm64-v8a\",\n  \"host\": \"macos-aarch64\",\n  \"avds\": [\"{name}\"]\n}}\n");
-    fs::write(&layout.manifest, manifest)?;
-    println!("managed AVD ready: {}", avd_path.display());
-    Ok(())
+    setup::run(layout)
 }
 
 #[cfg(test)]
@@ -982,6 +845,19 @@ mod tests {
         }
         fn console_avd_name(&self, _: u16) -> io::Result<String> {
             unreachable!()
+        }
+    }
+
+    struct RunningManagedProcess;
+    impl ClearOps for RunningManagedProcess {
+        fn console_owner(&self, _: u16) -> io::Result<Option<u32>> {
+            Ok(None)
+        }
+        fn console_avd_name(&self, _: u16) -> io::Result<String> {
+            unreachable!()
+        }
+        fn managed_emulator_pids(&self, _: &Path) -> io::Result<Vec<String>> {
+            Ok(vec!["1234".into()])
         }
     }
 
@@ -1224,6 +1100,16 @@ mod tests {
                 auth_fails: true
             })
             .is_err());
+        assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
+        fs::remove_dir_all(layout.root).unwrap();
+    }
+
+    #[test]
+    fn managed_process_without_console_refuses_clear() {
+        let layout = clear_fixture(&["Alpha"]);
+        let plan = plan_clear(&layout, Some("Alpha")).unwrap();
+        let error = plan.check_running(&RunningManagedProcess).unwrap_err();
+        assert!(error.to_string().contains("1234"));
         assert!(layout.avd.join("Alpha.avd/userdata.img").exists());
         fs::remove_dir_all(layout.root).unwrap();
     }

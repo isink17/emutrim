@@ -21,7 +21,7 @@ pub fn run(args: Vec<String>) -> io::Result<()> {
         }
     })?;
     let pending = managed::reset::validate_existing(&layout, &target)?;
-    managed::check_target_not_running(&target, &managed::SystemClearOps)?;
+    managed::check_target_not_running(&target, &layout, &managed::SystemClearOps)?;
     let info = avd::inspect_mode(name, true)?;
     avd::validate_ram(&info, info.ram_mb)?;
     if !info.image.is_dir() {

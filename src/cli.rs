@@ -52,7 +52,7 @@ fn managed_help(args: &[String]) -> &'static str {
     match args.iter().find(|arg| arg.as_str() != "--help" && arg.as_str() != "-h").map(String::as_str) {
         Some("root") => "Usage: emutrim managed root\n\nPrints managed data paths. EMUTRIM_HOME overrides the default root.",
         Some("status") => "Usage: emutrim managed status\n\nReports managed SDK, AVD, manifest, and disk usage.",
-        Some("setup") => "Usage: emutrim managed setup\n\nSets up managed Android assets. Currently supported on Apple Silicon macOS.",
+        Some("setup") => "Usage: emutrim managed setup\n\nSets up managed Android assets on Windows x86_64 and Apple Silicon macOS arm64.",
         Some("clean") => "Usage: emutrim managed clean [--yes]\n\nWithout --yes, previews managed payload cleanup. --yes removes managed payloads after safety checks.",
         _ => "Usage: emutrim managed root|status|setup|clean [--yes]\n\nUse 'emutrim managed <command> --help' for command details.",
     }
