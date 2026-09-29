@@ -743,6 +743,7 @@ fn running_managed_emulators(layout: &Layout) -> io::Result<Vec<String>> {
     running_managed_emulators_in(&layout.sdk.join("emulator"))
 }
 
+#[cfg(windows)]
 fn running_managed_emulators_in(emulator_dir: &Path) -> io::Result<Vec<String>> {
     let output = Command::new("powershell")
         .args(["-NoProfile", "-Command", "Get-CimInstance Win32_Process | ForEach-Object { if ($_.ExecutablePath) { \"$($_.ProcessId)|$($_.ExecutablePath)\" } }"])
