@@ -94,7 +94,7 @@ Customize `slim` with repeatable options:
 
 `off` and `restore` accept an optional serial; without one, EmuTrim selects the sole running emulator and refuses ambiguity. `--ram=N` is in MB. `--cold-boot` does not wipe data or delete snapshots. `--timings` reports startup phases.
 
-Managed setup uses an available Android SDK management CLI only to install packages into the isolated EmuTrim SDK. It selects the latest stable ordinary Google APIs system image available for the supported host architecture; API levels can differ by host. Licenses are never auto-accepted. Managed AVDs remain under the EmuTrim root, separate from Android Studio AVDs.
+Managed setup requires a healthy Android SDK management tool to install packages into the isolated EmuTrim SDK; the standalone Android CLI is preferred on Windows. It selects the latest stable ordinary Google APIs system image available for the supported host architecture; API levels can differ by host. Licenses are never auto-accepted. Managed AVDs remain under the EmuTrim root, separate from Android Studio AVDs.
 
 ## Inspect and stop
 
