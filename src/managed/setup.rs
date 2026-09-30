@@ -1156,7 +1156,10 @@ system-images/android-37.1/google_apis_ps16k/arm64-v8a 1.0.0 description\n";
 
     fn temp_root(label: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        env::temp_dir().join(format!(
+        let home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir);
+        home.join(format!(
             "{label}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
