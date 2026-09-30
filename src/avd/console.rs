@@ -1,3 +1,4 @@
+#[cfg(not(windows))]
 use std::env;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -49,6 +50,12 @@ fn response(reader: &mut BufReader<TcpStream>, deadline: Instant) -> io::Result<
     }
 }
 
+#[cfg(windows)]
+fn token_path() -> io::Result<PathBuf> {
+    crate::platform::emulator_console_token_path()
+}
+
+#[cfg(not(windows))]
 fn token_path() -> io::Result<PathBuf> {
     env::var_os("USERPROFILE")
         .map(PathBuf::from)
@@ -119,6 +126,43 @@ fn command_until(port: u16, command: &str, deadline: Instant) -> io::Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_console_token_ignores_redirected_environment() {
+        const EXPECTED: &str = "EMUTRIM_TEST_EXPECTED_CONSOLE_TOKEN";
+        if let Some(expected) = std::env::var_os(EXPECTED) {
+            assert_eq!(token_path().unwrap(), PathBuf::from(expected));
+            let configured = PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join(".emulator_console_auth_token");
+            if std::env::var("EMUTRIM_TEST_PROFILE_REDIRECTED").unwrap() == "1" {
+                assert_ne!(token_path().unwrap(), configured);
+            } else {
+                assert_eq!(token_path().unwrap(), configured);
+            }
+            return;
+        }
+        let redirected = std::env::temp_dir().join("emutrim-redirected-console-profile");
+        let native_token = token_path().unwrap();
+        for (profile, redirected) in [
+            (native_token.parent().unwrap(), "0"),
+            (redirected.as_path(), "1"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "avd::console::tests::windows_console_token_ignores_redirected_environment",
+                ])
+                .env(EXPECTED, &native_token)
+                .env("EMUTRIM_TEST_PROFILE_REDIRECTED", redirected)
+                .env("USERPROFILE", profile)
+                .env("HOME", profile)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{:?}", output);
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
+        }
+    }
 
     #[test]
     fn parses_console_avd_name() {

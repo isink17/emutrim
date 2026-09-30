@@ -23,6 +23,46 @@ const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
 const WAIT_FAILED: u32 = u32::MAX;
 
+#[link(name = "shell32")]
+extern "system" {
+    fn SHGetFolderPathW(
+        window: Handle,
+        folder: i32,
+        token: Handle,
+        flags: u32,
+        path: *mut u16,
+    ) -> i32;
+}
+
+pub fn emulator_console_token_path() -> io::Result<PathBuf> {
+    // The Windows Emulator uses the native profile, even with USERPROFILE overridden.
+    const CSIDL_PROFILE: i32 = 0x0028;
+    let mut path = [0u16; 260];
+    let result = unsafe {
+        SHGetFolderPathW(
+            ptr::null_mut(),
+            CSIDL_PROFILE,
+            ptr::null_mut(),
+            0,
+            path.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::other(format!(
+            "cannot resolve Emulator console token profile (HRESULT {result:#x})"
+        )));
+    }
+    let len = path.iter().position(|value| *value == 0).unwrap_or(0);
+    let profile = PathBuf::from(std::ffi::OsString::from_wide(&path[..len]));
+    if !profile.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows Emulator console profile is not an absolute path",
+        ));
+    }
+    Ok(profile.join(".emulator_console_auth_token"))
+}
+
 #[repr(C)]
 struct TcpRowOwnerPid {
     state: u32,
