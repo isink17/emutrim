@@ -438,16 +438,7 @@ fn parse_images(text: &str) -> Vec<SystemImage> {
 }
 
 fn parse_platform(platform: &str) -> Option<Vec<u32>> {
-    let version = platform.strip_prefix("android-")?;
-    let parts: Option<Vec<u32>> = version
-        .split('.')
-        .map(|part| {
-            (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-                .then(|| part.parse().ok())
-                .flatten()
-        })
-        .collect();
-    parts.filter(|parts| !parts.is_empty())
+    crate::avd::parse_numeric_version(platform.strip_prefix("android-")?)
 }
 
 fn select_image(images: &[SystemImage], host: Host) -> io::Result<SystemImage> {
@@ -567,11 +558,32 @@ pub(super) fn run(layout: &Layout) -> io::Result<()> {
             )
         })?;
     }
+    if repair_managed_avd_ram(layout, &name, &image)? {
+        println!("managed AVD RAM compatibility setting repaired");
+    }
     println!("managed AVD ready: {}", avd_path.display());
     if fresh {
         println!("managed system image: {package}");
     }
     Ok(())
+}
+
+fn repair_managed_avd_ram(layout: &Layout, name: &str, image: &SystemImage) -> io::Result<bool> {
+    if validate_avd(layout, name, image)?.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed AVD ownership validation failed before RAM repair",
+        ));
+    }
+    let root = layout.root.canonicalize()?;
+    let avd = layout.avd.join(format!("{name}.avd")).canonicalize()?;
+    if !avd.starts_with(&root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "managed AVD path escapes configured root",
+        ));
+    }
+    crate::avd::repair_managed_ram_config(&avd.join("config.ini"))
 }
 
 fn load_or_plan(
@@ -824,6 +836,12 @@ fn validate_avd(layout: &Layout, name: &str, image: &SystemImage) -> io::Result<
         }
     }
     if avd_exists && ini_exists {
+        let avd_base = layout.avd.canonicalize()?;
+        if !avd.canonicalize()?.starts_with(&avd_base) {
+            return Err(super::invalid_manifest(
+                "managed AVD path escapes managed AVD home",
+            ));
+        }
         let config = avd.join("config.ini");
         if !config.is_file()
             || !fs::read_to_string(config)?.lines().any(|line| {
@@ -838,7 +856,6 @@ fn validate_avd(layout: &Layout, name: &str, image: &SystemImage) -> io::Result<
                 "managed AVD config does not match manifest image",
             ));
         }
-        crate::avd::config_path_mode(name, true)?;
         return Ok(Some(()));
     }
     Ok(None)
@@ -1084,6 +1101,56 @@ system-images/android-37.1/google_apis_ps16k/arm64-v8a 1.0.0 description\n";
         let ini = layout.avd.join("EmuTrim_Managed.ini");
         fs::write(&ini, "path=C:\\outside\\owned.avd\n").unwrap();
         assert!(validate_avd(&layout, "EmuTrim_Managed", &image).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_repairs_only_owned_api37_ram_and_is_idempotent() {
+        let root = temp_root("managed API 37 RAM repair");
+        let layout = fixture_layout(root.clone());
+        prepare_managed_dirs(&layout).unwrap();
+        let image = parse_images("system-images;android-37.0;google_apis;x86_64")
+            .pop()
+            .unwrap();
+        let avd = layout.avd.join("EmuTrim_Managed.avd");
+        fs::create_dir_all(&avd).unwrap();
+        fs::write(
+            layout.avd.join("EmuTrim_Managed.ini"),
+            format!("path={}\n", avd.display()),
+        )
+        .unwrap();
+        let config = avd.join("config.ini");
+        fs::write(
+            &config,
+            "target=android-37.0\nhw.ramSize=2048\ncustom.key=keep\nimage.sysdir.1=system-images;android-37.0;google_apis;x86_64\n",
+        )
+        .unwrap();
+
+        assert!(repair_managed_avd_ram(&layout, "EmuTrim_Managed", &image).unwrap());
+        let repaired = fs::read_to_string(&config).unwrap();
+        assert!(repaired.contains("hw.ramSize=4096\n"));
+        assert!(repaired.contains("custom.key=keep\n"));
+        assert!(!repair_managed_avd_ram(&layout, "EmuTrim_Managed", &image).unwrap());
+        assert_eq!(fs::read_to_string(&config).unwrap(), repaired);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_never_repairs_avd_outside_managed_root() {
+        let root = temp_root("external AVD RAM stays untouched");
+        let layout = fixture_layout(root.join("emutrim"));
+        prepare_managed_dirs(&layout).unwrap();
+        let image = parse_images("system-images;android-37.0;google_apis;x86_64")
+            .pop()
+            .unwrap();
+        let external = root.join("external").join("EmuTrim_Managed.avd");
+        fs::create_dir_all(&external).unwrap();
+        let config = external.join("config.ini");
+        let original = "target=android-37.0\nhw.ramSize=2048\nimage.sysdir.1=system-images;android-37.0;google_apis;x86_64\n";
+        fs::write(&config, original).unwrap();
+
+        assert!(repair_managed_avd_ram(&layout, "EmuTrim_Managed", &image).is_err());
+        assert_eq!(fs::read_to_string(config).unwrap(), original);
         fs::remove_dir_all(root).unwrap();
     }
 

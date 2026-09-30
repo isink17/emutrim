@@ -154,6 +154,27 @@ pub(crate) fn config_path_mode(name: &str, managed: bool) -> io::Result<PathBuf>
         ))
     }
 }
+
+pub(crate) fn parse_numeric_version(value: &str) -> Option<Vec<u32>> {
+    let parts: Option<Vec<u32>> = value
+        .split('.')
+        .map(|part| {
+            (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| part.parse().ok())
+                .flatten()
+        })
+        .collect();
+    parts.filter(|parts| !parts.is_empty())
+}
+
+pub(crate) fn minimum_ram_mb(api: &str, is_16k: bool) -> Option<u32> {
+    let version = parse_numeric_version(api)?;
+    Some(if is_16k || version[0] >= 37 {
+        4096
+    } else {
+        1536
+    })
+}
 pub fn list_mode(managed: bool) -> io::Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in fs::read_dir(avd_base_mode(managed)?)? {
@@ -263,15 +284,25 @@ fn parse_ram_mb(value: &str) -> Option<u32> {
 }
 
 pub fn validate_ram(info: &AvdInfo, ram_mb: u32) -> io::Result<()> {
-    validate_ram_for_image(info.is_16k, ram_mb)
+    validate_ram_for_image(&info.api, info.is_16k, ram_mb)
 }
 
-fn validate_ram_for_image(is_16k: bool, ram_mb: u32) -> io::Result<()> {
-    if is_16k && ram_mb < 4096 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "16 KB system image requires at least 4096 MB; refusing incompatible --ram",
-        ));
+fn validate_ram_for_image(api: &str, is_16k: bool, ram_mb: u32) -> io::Result<()> {
+    let minimum = minimum_ram_mb(api, is_16k).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "AVD Android API metadata is invalid",
+        )
+    })?;
+    if ram_mb < minimum {
+        let message = if is_16k {
+            "16 KB system image requires at least 4096 MB; refusing incompatible --ram"
+        } else if minimum == 4096 {
+            "API 37+ phone AVD requires at least 4096 MB RAM"
+        } else {
+            "emulator RAM must be between 1536 and 8192 MB"
+        };
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
     }
     if !(1536..=8192).contains(&ram_mb) {
         return Err(io::Error::new(
@@ -280,6 +311,65 @@ fn validate_ram_for_image(is_16k: bool, ram_mb: u32) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+pub(crate) fn repair_managed_ram_config(path: &Path) -> io::Result<bool> {
+    let text = fs::read_to_string(path)?;
+    let config = parse(&text);
+    let api = config
+        .get("target")
+        .and_then(|target| target.strip_prefix("android-"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "AVD Android API metadata is invalid",
+            )
+        })?;
+    let minimum = minimum_ram_mb(api, is_16k(&config)).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "AVD Android API metadata is invalid",
+        )
+    })?;
+    let current = config
+        .get("hw.ramSize")
+        .and_then(|value| parse_ram_mb(value))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "AVD RAM is invalid"))?;
+    if current >= minimum {
+        return Ok(false);
+    }
+
+    let mut updated = String::with_capacity(text.len());
+    let mut replaced = false;
+    for line in text.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let content = body.strip_suffix('\r').unwrap_or(body);
+        if content
+            .split_once('=')
+            .is_some_and(|(key, _)| key.trim() == "hw.ramSize")
+        {
+            updated.push_str("hw.ramSize=");
+            updated.push_str(&minimum.to_string());
+            updated.push_str(if body.ends_with('\r') {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            });
+            replaced = true;
+        } else {
+            updated.push_str(line);
+        }
+    }
+    if !replaced {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "AVD RAM is invalid",
+        ));
+    }
+    fs::write(path, updated)?;
+    Ok(true)
 }
 
 pub fn available_console_port() -> io::Result<u16> {
@@ -326,9 +416,24 @@ fn tune_file(path: &PathBuf, requested_ram: Option<u32>) -> io::Result<()> {
             "AVD config has no system image path",
         ));
     }
+    let api = config
+        .get("target")
+        .and_then(|target| target.strip_prefix("android-"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "AVD Android API metadata is invalid",
+            )
+        })?;
     let is_16k = is_16k(&config);
-    let ram = requested_ram.unwrap_or(if is_16k { 4096 } else { 1536 });
-    validate_ram_for_image(is_16k, ram)?;
+    let minimum = minimum_ram_mb(api, is_16k).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "AVD Android API metadata is invalid",
+        )
+    })?;
+    let ram = requested_ram.unwrap_or(minimum);
+    validate_ram_for_image(api, is_16k, ram)?;
     let backup = path.with_extension("ini.emutrim.bak");
     if !backup.exists() {
         fs::write(&backup, &text)?;
@@ -395,6 +500,8 @@ pub fn start_mode(
     let datadir = layout
         .as_ref()
         .map(|layout| layout.avd.join(format!("{name}.avd")));
+    let lowram_eligible =
+        minimum_ram_mb(&info.api, info.is_16k).is_some_and(|minimum| minimum < 4096);
     command.args(launch_args(
         name,
         port,
@@ -402,7 +509,7 @@ pub fn start_mode(
         ram,
         snapshot,
         headless,
-        info.is_16k,
+        lowram_eligible,
     ));
     if let Some(layout) = layout {
         crate::managed::ensure_emulator_home(&layout)?;
@@ -425,7 +532,7 @@ fn launch_args(
     ram: u32,
     snapshot: SnapshotMode,
     headless: bool,
-    is_16k: bool,
+    lowram_eligible: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "-avd".into(),
@@ -448,7 +555,7 @@ fn launch_args(
     if headless {
         args.push("-no-window".into());
     }
-    if !is_16k {
+    if lowram_eligible {
         args.push("-lowram".into());
     }
     args
@@ -536,6 +643,7 @@ mod tests {
 
     #[test]
     fn headless_only_adds_no_window_and_composes_with_start_options() {
+        let api36_lowram = minimum_ram_mb("36", false).is_some_and(|minimum| minimum < 4096);
         let normal = launch_args(
             "Alpha",
             5554,
@@ -543,7 +651,7 @@ mod tests {
             2048,
             SnapshotMode::Normal,
             false,
-            false,
+            api36_lowram,
         );
         assert!(!normal.contains(&"-no-window".into()));
         let headless = launch_args(
@@ -553,7 +661,7 @@ mod tests {
             2048,
             SnapshotMode::ColdBoot,
             true,
-            false,
+            api36_lowram,
         );
         assert_eq!(
             headless.iter().filter(|arg| *arg == "-no-window").count(),
@@ -561,10 +669,19 @@ mod tests {
         );
         assert!(headless.contains(&"-no-snapshot".into()));
         assert!(headless.contains(&"-lowram".into()));
-        assert!(
-            !launch_args("Alpha", 5554, None, 4096, SnapshotMode::Normal, true, true)
-                .contains(&"-lowram".into())
-        );
+        let api37_lowram = minimum_ram_mb("37.0", false).is_some_and(|minimum| minimum < 4096);
+        assert!(!launch_args(
+            "Alpha",
+            5554,
+            None,
+            4096,
+            SnapshotMode::Normal,
+            true,
+            api37_lowram,
+        )
+        .contains(&"-lowram".into()));
+        let api37 = launch_args("Alpha", 5554, None, 4096, SnapshotMode::Normal, true, false);
+        assert!(!api37.contains(&"-lowram".into()));
     }
 
     #[test]
@@ -577,7 +694,7 @@ mod tests {
             4096,
             SnapshotMode::Reset,
             false,
-            true,
+            false,
         );
         assert_eq!(
             args[..10],
@@ -603,6 +720,7 @@ mod tests {
         );
         assert!(!args.contains(&"-no-snapshot".into()));
         assert!(!args.contains(&"-no-window".into()));
+        assert!(!args.contains(&"-lowram".into()));
     }
 
     #[test]
@@ -618,20 +736,58 @@ mod tests {
     }
 
     #[test]
-    fn ram_validation_enforces_image_and_emulator_limits() {
+    fn ram_validation_enforces_api_image_and_emulator_limits() {
         let info = AvdInfo {
-            api: "37".into(),
+            api: "36".into(),
             abi: "x86_64".into(),
             tag: "google_apis".into(),
             ram_mb: 4096,
             image: PathBuf::new(),
-            is_16k: true,
+            is_16k: false,
             gpu_mode: "host".into(),
             gpu_enabled: "yes".into(),
             backup_exists: false,
         };
-        assert!(validate_ram(&info, 1536).is_err());
+        assert!(validate_ram(&info, 2048).is_ok());
+        let api37 = AvdInfo {
+            api: "37".into(),
+            ..info.clone()
+        };
+        assert!(validate_ram(&api37, 2048).is_err());
+        assert!(validate_ram(&api37, 4096).is_ok());
+        let api37dot0 = AvdInfo {
+            api: "37.0".into(),
+            ..info.clone()
+        };
+        assert!(validate_ram(&api37dot0, 4096).is_ok());
+        let api38 = AvdInfo {
+            api: "38".into(),
+            ..info.clone()
+        };
+        assert!(validate_ram(&api38, 3072).is_err());
+        let old_16k = AvdInfo {
+            is_16k: true,
+            ..info.clone()
+        };
+        assert!(validate_ram(&old_16k, 3072).is_err());
+        let malformed = AvdInfo {
+            api: "37-ext1".into(),
+            ..info.clone()
+        };
+        assert!(validate_ram(&malformed, 4096).is_err());
         assert!(validate_ram(&info, 4096).is_ok());
+    }
+
+    #[test]
+    fn numeric_android_versions_are_strict_and_drive_ram_minimum() {
+        for api in ["37", "37.0", "37.1", "38"] {
+            assert_eq!(minimum_ram_mb(api, false), Some(4096));
+        }
+        assert_eq!(minimum_ram_mb("36", false), Some(1536));
+        assert_eq!(minimum_ram_mb("36", true), Some(4096));
+        for api in ["", "beta", "37-ext1", "canary", "4294967296"] {
+            assert_eq!(minimum_ram_mb(api, false), None);
+        }
     }
     #[test]
     fn parser_ignores_malformed() {
@@ -657,7 +813,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            "hw.ramSize=2048\ncustom.key=keep\nhw.gpu.mode=auto\nhw.audioInput=no\nhw.camera.back=none\nimage.sysdir.1=system-images;android-31;google_apis;x86_64\n",
+            "hw.ramSize=2048\ntarget=android-31\ncustom.key=keep\nhw.gpu.mode=auto\nhw.audioInput=no\nhw.camera.back=none\nimage.sysdir.1=system-images;android-31;google_apis;x86_64\n",
         )
         .unwrap();
         tune_file(&path, Some(1536)).unwrap();
@@ -669,7 +825,7 @@ mod tests {
         assert!(edited.contains("hw.camera.back=none\n"));
         assert_eq!(
             fs::read_to_string(path.with_extension("ini.emutrim.bak")).unwrap(),
-            "hw.ramSize=2048\ncustom.key=keep\nhw.gpu.mode=auto\nhw.audioInput=no\nhw.camera.back=none\nimage.sysdir.1=system-images;android-31;google_apis;x86_64\n"
+            "hw.ramSize=2048\ntarget=android-31\ncustom.key=keep\nhw.gpu.mode=auto\nhw.audioInput=no\nhw.camera.back=none\nimage.sysdir.1=system-images;android-31;google_apis;x86_64\n"
         );
         let _ = fs::remove_file(path.with_extension("ini.emutrim.bak"));
         let _ = fs::remove_file(path);
@@ -689,11 +845,24 @@ mod tests {
 
     #[test]
     fn tune_defaults_ram_from_detected_image_page_size() {
-        for (image, expected) in [
-            ("system-images;android-31;google_apis;x86_64", "1536"),
-            ("system-images;android-37;google_apis_ps16k;x86_64", "4096"),
+        for (target, image, expected) in [
+            (
+                "android-31",
+                "system-images;android-31;google_apis;x86_64",
+                "1536",
+            ),
+            (
+                "android-37.0",
+                "system-images;android-37.0;google_apis;x86_64",
+                "4096",
+            ),
+            (
+                "android-37.1",
+                "system-images;android-37.1;google_apis_ps16k;x86_64",
+                "4096",
+            ),
         ] {
-            let path = temp_config(&format!("image.sysdir.1={image}\n"));
+            let path = temp_config(&format!("target={target}\nimage.sysdir.1={image}\n"));
             tune_file(&path, None).unwrap();
             assert!(fs::read_to_string(&path)
                 .unwrap()
@@ -705,8 +874,9 @@ mod tests {
 
     #[test]
     fn tune_accepts_explicit_ram_and_rejects_invalid_16k_values_before_backup() {
-        let path =
-            temp_config("image.sysdir.1=system-images;android-37;google_apis_ps16k;x86_64\n");
+        let path = temp_config(
+            "target=android-37.0\nimage.sysdir.1=system-images;android-37.0;google_apis_ps16k;x86_64\n",
+        );
         let original = fs::read_to_string(&path).unwrap();
         assert!(tune_file(&path, Some(1536)).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
@@ -720,12 +890,38 @@ mod tests {
     }
 
     #[test]
+    fn tune_api37_rejects_explicit_low_ram_without_backup() {
+        let path = temp_config(
+            "target=android-37.0\nimage.sysdir.1=system-images;android-37.0;google_apis;x86_64\n",
+        );
+        let original = fs::read_to_string(&path).unwrap();
+        let error = tune_file(&path, Some(2048)).unwrap_err();
+        assert!(error.to_string().contains("API 37+ phone AVD"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.with_extension("ini.emutrim.bak").exists());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn tune_rejects_unresolved_image_before_mutation() {
         let path = temp_config("hw.ramSize=4096\ncustom.key=keep\n");
         let original = fs::read_to_string(&path).unwrap();
         assert!(tune_file(&path, None).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert!(!path.with_extension("ini.emutrim.bak").exists());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn managed_ram_repair_changes_only_ram_once_and_preserves_line_endings() {
+        let path = temp_config(
+            "target=android-37.0\r\nhw.ramSize=2048\r\ncustom.key=keep\r\nimage.sysdir.1=system-images;android-37.0;google_apis;x86_64\r\n",
+        );
+        assert!(repair_managed_ram_config(&path).unwrap());
+        let expected = "target=android-37.0\r\nhw.ramSize=4096\r\ncustom.key=keep\r\nimage.sysdir.1=system-images;android-37.0;google_apis;x86_64\r\n";
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        assert!(!repair_managed_ram_config(&path).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
         let _ = fs::remove_file(path);
     }
 }

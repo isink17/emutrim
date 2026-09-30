@@ -84,10 +84,10 @@ Customize `slim` with repeatable options:
 | `restore [SERIAL]` | Restore recorded package and setting state; retry incomplete restores safely. |
 | `watch [--serial=SERIAL]` | Watch ADB device events and slim eligible emulator connections; `--dry-run` reports without mutation. |
 | `stats <SERIAL> [--seconds=N]` | Read Windows process working set, private memory, CPU, threads, and handles. Unsupported on macOS. |
-| `tune-avd [AVD] [--managed] [--ram=N]` | Update AVD RAM/GPU settings after backing up `config.ini`; without `--ram`, selects 4096 MB for detected 16 KB images and 1536 MB for other configured images. Missing image paths fail safely. Omitting AVD works only when exactly one is installed in selected environment. |
+| `tune-avd [AVD] [--managed] [--ram=N]` | Update AVD RAM/GPU settings after backing up `config.ini`; without `--ram`, selects 4096 MB for API 37+ or detected 16 KB images and 1536 MB otherwise. Missing image paths fail safely. Omitting AVD works only when exactly one is installed in selected environment. |
 | `managed root` | Print EmuTrim data root. |
 | `managed status` | Report isolated managed SDK/AVD setup. |
-| `managed setup` | Set up managed Android assets on Windows x86_64 or Apple Silicon macOS arm64. Selects latest stable ordinary Google APIs image for host architecture. |
+| `managed setup` | Set up managed Android assets on Windows x86_64 or Apple Silicon macOS arm64. Selects latest stable ordinary Google APIs image for host architecture and repairs owned AVD RAM to meet its minimum. |
 | `managed clean [--yes]` | Preview managed cleanup; `--yes` deletes managed payloads. |
 | `clear [AVD_NAME|all] [--yes]` | Preview or remove only positively identified EmuTrim-managed AVD definitions and their mutable files. |
 | `reset <AVD_NAME> [--yes]` | Preview or factory-reset guest userdata of one positively identified managed AVD; retains AVD and SD-card image. |
@@ -139,7 +139,7 @@ When EmuTrim cannot prove that a target or saved state is safe, it refuses to mu
 - EmuTrim targets the exact serial and, for integrated `start`, verifies the selected console port belongs to the launched process. Port selection stays within the supported console range.
 - Reversible state is saved and read back before mutation. Restore uses recorded originals only, checkpoints successful reversals, and can be retried. Missing state is a no-op; malformed/unreadable state is an error.
 - Packages disabled before EmuTrim are protected from overwrite. Boot-critical Google Bluetooth is protected.
-- RAM validation enforces 4096 MB minimum for detected 16 KB images and rejects values outside 1536–8192 MB. `tune-avd` preserves a `config.ini` backup.
+- RAM validation enforces 4096 MB minimum for API 37+ phone AVDs and detected 16 KB images, and rejects values outside 1536–8192 MB. `tune-avd` preserves a `config.ini` backup.
 - Runtime ADB connects directly to `127.0.0.1:5037` using the smart socket; guest operations do not spawn `adb`. EmuTrim has no runtime avdslim dependency.
 - `watch` uses event-driven ADB tracking with bounded boot checks.
 
