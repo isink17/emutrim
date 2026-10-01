@@ -1,6 +1,7 @@
 use super::ProcessStats;
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub fn tcp_listener_image(_port: u16) -> io::Result<Option<(u32, PathBuf)>> {
     Ok(None)
@@ -42,6 +43,13 @@ pub fn shutdown_helper_pids(_pid: u32) -> io::Result<Vec<u32>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Emulator shutdown helper lookup is unsupported on this host",
+    ))
+}
+
+pub fn terminate_launch_descendants(_launch_pid: u32, _timeout: Duration) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "launch descendant cleanup is unsupported on this host",
     ))
 }
 
