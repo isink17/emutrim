@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/android/testing-samples",
+  "commit": "8c9df3a534ef99e44d481d96c00a5fc1970f7c70",
+  "project": "ui/espresso/BasicSample",
+  "license": "Apache-2.0",
+  "application_id": "com.example.android.testing.espresso.BasicSample",
+  "main_activity": "com.example.android.testing.espresso.BasicSample.MainActivity",
+  "compile_sdk": 34,
+  "build_tools": "34.0.0",
+  "agp": "8.5.0",
+  "gradle": "8.7",
+  "kotlin": "1.9.22",
+  "instrumentation_runner": "androidx.test.runner.AndroidJUnitRunner"
+}
