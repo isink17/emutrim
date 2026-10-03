@@ -30,7 +30,7 @@ function Test-Port([int]$p){$c=[Net.Sockets.TcpClient]::new();try{$a=$c.BeginCon
 function Get-ManagedProcesses { @(Get-CimInstance Win32_Process -Filter "name='emulator.exe' OR name LIKE 'qemu-system-%'" | Where-Object { $_.ExecutablePath -like "$sdk*" -or $_.CommandLine -like "*$avd*" }) }
 if(!(Test-Path $emu) -or !(Test-Path $adb) -or !(Test-Path -LiteralPath $exe -PathType Leaf)){throw 'required managed Emulator, ADB, or selected EmuTrim executable missing'}
 $emulatorVersion=(& $emu -version 2>&1 | Select-Object -First 1).ToString().Trim()
-if($emulatorVersion -notmatch '37\.1\.11'){throw "stable endurance requires Emulator 37.1.11; selected root reports: $emulatorVersion"}
+if($emulatorVersion -notmatch '^Android emulator version 37\.1\.11\.0 \(build_id 15917651\)(?: \(CL:[^)]+\))?$'){throw "stable endurance requires Emulator 37.1.11.0 (build_id 15917651); selected root reports: $emulatorVersion"}
 if((Get-Process emulator,qemu-system-x86_64,qemu-system-aarch64 -ErrorAction SilentlyContinue)){throw 'emulator/QEMU already running; refusing series'}
 if(Test-Port 5037){throw 'ADB listener already exists; refusing to interfere with another server'}
 if(Test-Port $port){throw 'console port already occupied'}

@@ -830,12 +830,14 @@ function Get-XmlSuiteSummary([datetime]$SinceUtc, [hashtable]$BeforeHashes) {
 
 function Get-ResultObject([object[]]$Trials, [object[]]$Warmups, [object[]]$Failures, [string]$Status) {
     $commit = (& git -C $script:Repo rev-parse HEAD).Trim()
+    $branch = (& git -C $script:Repo rev-parse --abbrev-ref HEAD).Trim()
     return [ordered]@{
         schema_version = 1
         benchmark_version = 'windows-product-proof-1'
         status = $Status
         generated_utc = [datetime]::UtcNow.ToString('o')
         emutrim_commit = $commit
+        emutrim_branch = $branch
         harness_sha256 = (Get-FileHash -LiteralPath $script:HarnessPath -Algorithm SHA256).Hash
         emutrim_version = '0.7.0'
         fixture_repository = 'https://github.com/android/testing-samples'
@@ -1274,7 +1276,8 @@ function Get-EnvironmentMetadata($Runtime, $HostMetadata, $Build, $Fixture, $Adb
     $Runtime.page_size = $PageSize
     return [ordered]@{
         generated_utc = [datetime]::UtcNow.ToString('o')
-        emutrim_commit = 'e6a6da2868ce47502e4b5a58588d1a4bff5ec89a'
+        emutrim_commit = (& git -C $script:Repo rev-parse HEAD).Trim()
+        emutrim_branch = (& git -C $script:Repo rev-parse --abbrev-ref HEAD).Trim()
         emutrim_version = '0.7.0'
         host = $HostMetadata
         runtime = $Runtime
