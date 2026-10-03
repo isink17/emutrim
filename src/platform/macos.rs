@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 const LSOF: &str = "/usr/sbin/lsof";
 const PS: &str = "/bin/ps";
@@ -218,6 +219,14 @@ fn parse_parent_pid(output: &[u8], pid: u32) -> io::Result<u32> {
     value
         .parse::<u32>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid ps parent PID"))
+}
+
+pub fn terminate_launch_descendants(_launch_pid: u32, _timeout: Duration) -> io::Result<()> {
+    // Unix reaping can release the launch PID, so descendants cannot be pinned safely here.
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "launch descendant cleanup is unsupported on macOS",
+    ))
 }
 
 pub fn belongs_to_launch(owner_pid: u32, launch_pid: u32) -> io::Result<bool> {

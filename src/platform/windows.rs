@@ -7,6 +7,7 @@ use std::net::Ipv4Addr;
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr;
+use std::time::{Duration, Instant};
 
 type Handle = *mut c_void;
 const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
@@ -22,6 +23,8 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
 const WAIT_FAILED: u32 = u32::MAX;
+const PROCESS_TERMINATE: u32 = 0x0001;
+const ERROR_INVALID_PARAMETER: i32 = 87;
 
 #[link(name = "shell32")]
 extern "system" {
@@ -147,6 +150,7 @@ extern "system" {
         user: *mut FileTime,
     ) -> i32;
     fn GetProcessHandleCount(process: Handle, count: *mut u32) -> i32;
+    fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
     fn CloseHandle(handle: Handle) -> i32;
 }
 
@@ -390,6 +394,153 @@ fn is_descendant_or_same(
     false
 }
 
+/// Terminates live descendants of `launch_pid`, which the caller must keep pinned with an open
+/// process handle. Every ancestry link is checked after the processes are pinned, and parents
+/// must be created no later than their children, so stale or reused parent PIDs never match.
+pub fn terminate_launch_descendants(launch_pid: u32, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let launch = open_process(launch_pid, PROCESS_QUERY_LIMITED_INFORMATION)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("launch process {launch_pid} unavailable"),
+        )
+    })?;
+    let launch_created = process_creation_ticks(&launch)?;
+    let mut errors = Vec::new();
+    let mut pinned = HashMap::new();
+    let candidates = process_tree()?;
+    for &pid in candidates.keys() {
+        if pid == launch_pid || !is_descendant_or_same(pid, launch_pid, &candidates) {
+            continue;
+        }
+        match open_process(
+            pid,
+            PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+        ) {
+            Ok(Some(process)) => match process_creation_ticks(&process) {
+                Ok(created) => {
+                    pinned.insert(pid, (process, created));
+                }
+                Err(error) => errors.push(format!("cannot inspect process {pid}: {error}")),
+            },
+            Ok(None) => {}
+            Err(error) => errors.push(format!("cannot open process {pid}: {error}")),
+        }
+    }
+    let parents = process_tree()?
+        .into_iter()
+        .map(|(pid, (parent, _))| (pid, parent))
+        .collect();
+    let created = pinned
+        .iter()
+        .map(|(pid, (_, created))| (*pid, *created))
+        .collect();
+    let owned = owned_descendants(launch_pid, launch_created, &parents, &created);
+    for pid in &owned {
+        let process = &pinned[pid].0;
+        if unsafe { TerminateProcess(process.0, 1) } == 0 {
+            let error = io::Error::last_os_error();
+            if process_wait_result(unsafe { WaitForSingleObject(process.0, 0) })? {
+                errors.push(format!("cannot terminate process {pid}: {error}"));
+            }
+        }
+    }
+    let mut alive = Vec::new();
+    for pid in &owned {
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(u128::from(u32::MAX - 1)) as u32;
+        if process_wait_result(unsafe { WaitForSingleObject(pinned[pid].0 .0, wait) })? {
+            alive.push(pid.to_string());
+        }
+    }
+    if !alive.is_empty() {
+        errors.push(format!(
+            "launch descendant process(es) {} still running",
+            alive.join(", ")
+        ));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(errors.join("; ")))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn child_pids(pid: u32) -> io::Result<Vec<u32>> {
+    Ok(process_tree()?
+        .into_iter()
+        .filter(|(child, (parent, _))| *parent == pid && *child != pid)
+        .map(|(child, _)| child)
+        .collect())
+}
+
+fn open_process(pid: u32, access: u32) -> io::Result<Option<OwnedHandle>> {
+    let handle = unsafe { OpenProcess(access, 0, pid) };
+    if !handle.is_null() {
+        return Ok(Some(OwnedHandle(handle)));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+fn process_creation_ticks(process: &OwnedHandle) -> io::Result<u64> {
+    let mut creation: FileTime = unsafe { zeroed() };
+    let mut exit: FileTime = unsafe { zeroed() };
+    let mut kernel: FileTime = unsafe { zeroed() };
+    let mut user: FileTime = unsafe { zeroed() };
+    if unsafe { GetProcessTimes(process.0, &mut creation, &mut exit, &mut kernel, &mut user) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(filetime_ticks(&creation))
+}
+
+fn owned_descendants(
+    launch_pid: u32,
+    launch_created: u64,
+    parents: &HashMap<u32, u32>,
+    created: &HashMap<u32, u64>,
+) -> Vec<u32> {
+    let mut owned: Vec<u32> = created
+        .keys()
+        .copied()
+        .filter(|&pid| {
+            let mut current = pid;
+            for _ in 0..=created.len() {
+                let (Some(&parent), Some(&current_created)) =
+                    (parents.get(&current), created.get(&current))
+                else {
+                    return false;
+                };
+                let parent_created = if parent == launch_pid {
+                    launch_created
+                } else if let Some(&parent_created) = created.get(&parent) {
+                    parent_created
+                } else {
+                    return false;
+                };
+                if parent_created > current_created {
+                    return false;
+                }
+                if parent == launch_pid {
+                    return true;
+                }
+                current = parent;
+            }
+            false
+        })
+        .collect();
+    owned.sort_unstable();
+    owned
+}
+
 fn filetime_ticks(value: &FileTime) -> u64 {
     (u64::from(value.high) << 32) | u64::from(value.low)
 }
@@ -466,6 +617,32 @@ mod tests {
         assert!(is_descendant_or_same(50, 30, &parents));
         assert!(!is_descendant_or_same(70, 30, &parents));
         assert!(!is_descendant_or_same(999, 30, &parents));
+    }
+
+    #[test]
+    fn launch_cleanup_targets_only_pinned_descendants_created_after_their_parents() {
+        // 40 launch (t=100): 50 qemu -> 60 helper; 70 stale PPID; 80 unrelated; 91 via unpinned 90.
+        let parents = HashMap::from([
+            (50, 40),
+            (60, 50),
+            (70, 40),
+            (80, 30),
+            (90, 40),
+            (91, 90),
+            (95, 96),
+            (96, 95),
+        ]);
+        let created = HashMap::from([
+            (50, 110),
+            (60, 120),
+            (70, 90),
+            (80, 130),
+            (91, 140),
+            (95, 150),
+            (96, 150),
+        ]);
+        assert_eq!(owned_descendants(40, 100, &parents, &created), [50, 60]);
+        assert!(owned_descendants(40, 100, &HashMap::new(), &created).is_empty());
     }
 
     #[test]
