@@ -30,7 +30,7 @@ cargo install --git https://github.com/isink17/emutrim emutrim
 For a reproducible version, install the current release tag:
 
 ```sh
-cargo install --git https://github.com/isink17/emutrim --tag v0.6.0 emutrim
+cargo install --git https://github.com/isink17/emutrim --tag v0.7.0 emutrim
 ```
 
 EmuTrim is not published on crates.io.
@@ -131,6 +131,8 @@ emutrim managed clean --yes
 
 `start` launches an AVD and applies EmuTrim's reversible profile. `reset AVD_NAME` is managed-only and dry-run by default. `reset AVD_NAME --yes` uses Emulator `-wipe-data -no-snapshot-load`, waits for verified boot, verifies EmuTrim guest state is absent, then stops the exact emulator. It retains the AVD definition, managed SDK/system image, and host `sdcard.img`; it resets guest userdata, not all storage. Android Emulator documents that `-wipe-data` does not affect `sdcard.img`. Its simulated SD-card feature is unsupported on Apple Silicon Macs, so guest-visible mounting is not part of EmuTrim's macOS acceptance. Running AVDs must be stopped first. A pending reset blocks `start`, `slim`, `restore`/`off`, `watch`, and `clear` for that AVD until reset is retried with `--yes`. `clear` deletes the managed AVD definition and mutable directory; `managed clean --yes` deletes the full managed environment.
 
+Quick Boot: `-no-snapshot-load` prevents loading a snapshot for the reset launch; it does not itself prevent saving Quick Boot state during shutdown. Reset does not guarantee that every snapshot is deleted or that the next start cannot restore Quick Boot state. See the [Android Emulator command-line documentation](https://developer.android.com/studio/run/emulator-commandline).
+
 ## Safety model
 
 When EmuTrim cannot prove that a target or saved state is safe, it refuses to mutate it rather than guessing. This is its fail-closed behavior.
@@ -160,9 +162,15 @@ Live tests used specific disposable images, not broad Android-version qualificat
 Package counts vary by image and architecture. Android 12 TV image lacks `com.google.android.bluetooth`.
 Apple Silicon macOS managed AVD setup and isolation have also been live-qualified; no package-count comparison is claimed.
 
+One controlled Windows x86_64 validation used Windows build 26200.9457, Android Emulator 37.2.11.0 (build 16416033), and API 37 Google APIs x86_64 image revision 6, extension 22, with 4096 MB AVD RAM. A reset-produced `default_boot` snapshot explicitly restored; ADB came online and Android boot completed. During approximately 122.5 seconds of post-boot observation, `system_server` remained stable, Package/Activity/User services were available, and `pm list features` succeeded. Task-scoped forced cleanup was verified; authenticated graceful shutdown was not proven. This specific successful validation does not establish general snapshot compatibility or longer-term framework health.
+
+Whether later CONTROL (`start --no-slim`), `slim`, or `restore` lifecycle operations caused the historical unhealthy snapshot remains unresolved. General WHPX reliability is not established: intermittent `WHPX 0x80070005` failures are not an established EmuTrim defect, and reboot is not proven to fix their underlying cause.
+
 ## Benchmarks
 
 The measured Windows configuration did not show RAM savings. It showed a modest lower idle CPU signal in the tested setup. These results are not a general performance claim. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology, full results, and qualifications. No macOS benchmark is claimed.
+
+Definitive v0.8 five-pair product benchmark results are not yet established. The snapshot-restoration validation above is not a stock-versus-slim benchmark and establishes no general RAM, CPU, or startup performance advantage.
 
 ## Build and test
 
